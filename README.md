@@ -123,6 +123,47 @@ systemctl --user enable --now mcbot
 | `ALERT_CHANNEL_ID` / `TEMP_WARN` | 温度警告の送り先と、警告する温度 |
 | `SERVER_PROPERTIES` | `server.properties` の場所（空なら `~/minecraft/server.properties`） |
 | `PANEL_CHANNEL_ID` | 管理パネルを置くチャンネルのID。設定すると、パネルが常に一番下になるように送り直されます |
+| `REGISTER_CHANNEL_ID` / `MC_DIR` など | ユーザー登録パネルのチャンネルと、サーバーのフォルダ（上の「ユーザー登録」参照） |
+
+## ユーザー登録（Discord のメンバーが自分でホワイトリストに登録）
+
+Discord サーバーのメンバーなら誰でも、管理者の承認なしで自分のマイクラ（統合版）アカウントをホワイトリストに登録できます。
+
+- `REGISTER_CHANNEL_ID` のチャンネルに「ユーザー登録パネル」が1つ置かれます（ステータス・接続先・参加手順と、🟢参加登録 / 📋登録一覧（Discord サーバーの管理者だけが見られます）ボタン）。ボタンはボット再起動後も動き、他の人が投稿するとパネルは一番下に送り直されます
+- **参加登録**: ユーザー名（「.」なし。付けても可）を入力 → ボットが RCON で `fwhitelist add 名前` を実行
+  - 成功 → その場で登録完了
+  - 失敗（Floodgate が名前から XUID を引けない）→ 「接続待ち」になり、**10分以内に一度サーバーに接続**してもらいます。ホワイトリストで弾かれますが、そのとき `plugin/` のプラグインがログに名前と UUID を書き、ボットがそれを読んで `whitelist.json` に追加 → `whitelist reload` → DM で通知します（DM が送れないときはチャンネルでメンションし、5分後に削除）
+- 1人につき1アカウント（もう一度登録すると前のアカウントは外れます）。ほかの人が登録済みの名前、管理者がすでにホワイトリストに入れている名前は登録できません
+- 誰がどのアカウントを登録したかは `registrations.json` に保存されます（Git には入りません）。Discord サーバーから抜けたメンバーのアカウントは自動でホワイトリストから外れます
+- 管理者用: `/登録解除 ユーザー`（Discord サーバーの管理者権限を持つ人だけ）
+
+### 設定
+
+1. [Discord Developer Portal](https://discord.com/developers/applications) → Bot → **Server Members Intent を ON**（退出の検知に必要。ONにしないとボットが起動できません）
+2. ボットに、登録チャンネルの「チャンネルを見る」「メッセージを送信」「埋め込みリンク」「メッセージ管理」権限を付ける
+3. `.env` に `REGISTER_CHANNEL_ID=チャンネルID` を書く（`PANEL_CHANNEL_ID` とは別のチャンネル）。必要なら `MC_DIR` なども
+4. プラグインをビルドして入れる（下記）→ マイクラサーバーを再起動
+5. ボットを再起動する: `systemctl --user restart mcbot`
+
+### プラグインのビルド（`plugin/`）
+
+拒否された接続の名前と UUID は Floodgate のログに出ないため、小さな Paper プラグイン（ログを1行書くだけで、誰が入れるかは変えません）を使います。必要なのは **JDK**（`sudo apt install openjdk-25-jdk-headless`）だけで、Maven / Gradle は不要です。
+
+```bash
+./plugin/build.sh                      # plugin/build/McbotWhitelist.jar ができる（サーバーが ~/minecraft 以外なら引数でフォルダを指定）
+cp plugin/build/McbotWhitelist.jar ~/minecraft/plugins/
+systemctl --user restart minecraft     # プレイヤーがいないときに
+```
+
+ログには `[McbotWhitelist] REJECT .名前 UUID` という行が出ます。
+
+### 動作確認
+
+1. サーバー起動後、登録チャンネルにパネルが出ていること
+2. 管理者以外のアカウントで「参加登録」→ 名前を入力。「登録しました」か「10分以内に接続してください」が自分にだけ見える形で返る
+3. 接続待ちの場合は、マイクラから接続（弾かれる）→ 数秒後に DM「登録しました！もう一度接続してください」→ 再接続して入れる
+4. 管理者アカウントで「📋 登録一覧」を押すと（管理者以外が押すと断られる）「Discord ユーザー → `.名前`」が出る
+5. `/登録解除` で外れること、ボットを再起動しても各ボタンが動くこと
 
 ## メモ
 

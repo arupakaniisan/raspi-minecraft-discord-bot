@@ -11,6 +11,28 @@ Raspberry Pi 5 で動かしているマイクラサーバー（Paper + Geyser）
 | `/status` | 起動中かどうか、接続中のプレイヤー | 全員 |
 | `/pc` | CPU温度・CPU使用率・負荷・メモリ・ストレージ・性能制限の有無 | 全員 |
 | `/cmd` | サーバーのコンソールコマンドを実行（例: `whitelist add .名前`） | `ADMIN_IDS` の人 |
+| `/panel` | 今のチャンネルにボタン付きの「サーバー管理パネル」を設置 | `ADMIN_IDS` の人 |
+
+### サーバー管理パネル
+
+`/panel` を実行すると、そのチャンネルに次のようなパネルが投稿されます。
+
+- **表示**: ステータス（🟢オンライン／🔴オフライン／🟡起動中・停止中）、オンライン人数、接続中のプレイヤー、ラズパイの CPU温度・CPU使用率・メモリ使用率、接続先、最終更新時刻。枠の色もステータスに合わせて緑・赤・黄色に変わります
+- **ボタン**:
+
+  | ボタン | 内容 | 押せる人 |
+  |---|---|---|
+  | ▶️ 起動 | サーバーを起動（オンライン中は押せません） | 全員 |
+  | ⏹️ 停止 | ワールドを保存して停止（オフライン中は押せません） | `ADMIN_IDS` の人 |
+  | 🔄 再起動 | サーバーを再起動（オフライン中は押せません） | `ADMIN_IDS` の人 |
+  | 🔃 更新 | パネルをすぐに更新 | 全員 |
+  | 🤖 ボット再起動 | `systemctl --user restart mcbot` でボットを再起動 | `ADMIN_IDS` の人 |
+
+- **自動更新**: 30秒ごとに更新されます。起動・停止・再起動ボタンを押した直後は、状態が落ち着くまで3秒おきに更新されます
+- パネルの場所は `panel.json` に保存されるので、ボットを再起動しても同じメッセージが更新され続け、ボタンもそのまま使えます
+- もう一度 `/panel` を実行すると、新しいチャンネルにパネルを設置し直し、前のパネルは削除されます。パネルのメッセージを手で消した場合は、`/panel` で設置し直してください
+- ボットには、そのチャンネルの「チャンネルを見る」「メッセージを送信」「埋め込みリンク」の権限が必要です
+- `ADMIN_IDS` が空だと、`/panel` と管理者用のボタンは誰も使えません
 
 `ALERT_CHANNEL_ID` を設定すると、CPU温度が `TEMP_WARN`（初期値75℃）を超えたときにそのチャンネルへ警告します。
 
@@ -31,7 +53,7 @@ Discord ──▶ bot.py (mcbot.service)
 
 1. [Discord Developer Portal](https://discord.com/developers/applications) で「New Application」
 2. 「Bot」→「Reset Token」でトークンを控える（**公開しない**）
-3. 「OAuth2」→「URL Generator」で Scopes に `bot` と `applications.commands`、Bot Permissions に `Send Messages` を選び、出てきたURLからサーバーに追加
+3. 「OAuth2」→「URL Generator」で Scopes に `bot` と `applications.commands`、Bot Permissions に `Send Messages` と `Embed Links`（パネル用）を選び、出てきたURLからサーバーに追加
 
 ### 2. マイクラ側で RCON を有効にする
 

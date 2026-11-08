@@ -6,15 +6,21 @@ Slash commands:
   /status  Show whether the server is running and who is online
   /pc      Show Raspberry Pi temperature, CPU, memory and disk usage
   /cmd     Run a server console command via RCON (admins only)
+  /panel   Post a server control panel with buttons (admins only)
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
+import re
 import socket
 import struct
 import subprocess
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import discord
@@ -43,6 +49,18 @@ ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0") or 0)
 TEMP_WARN = float(os.getenv("TEMP_WARN", "75"))
 
 GUILD = discord.Object(id=GUILD_ID)
+
+# The bot's own systemd user service (used by the panel's "bot restart" button).
+BOT_SERVICE = "mcbot"
+
+# Where the panel's channel/message IDs are kept across restarts.
+PANEL_FILE = Path(__file__).resolve().parent / "panel.json"
+PANEL_INTERVAL = 30       # normal auto refresh (seconds)
+PANEL_FAST_INTERVAL = 3   # refresh interval right after start/stop/restart
+PANEL_FAST_MIN = 10       # keep fast refresh at least this long after a button
+PANEL_FAST_MAX = 180      # ...and at most this long
+
+log = logging.getLogger("mcbot")
 
 
 # ---------------------------------------------------------------- systemd
@@ -157,6 +175,220 @@ def temp_label(t: float | None) -> str:
     return f"{t:.1f}℃ ✅"
 
 
+# ---------------------------------------------------------------- panel state
+
+ONLINE, OFFLINE, STARTING, STOPPING = "online", "offline", "starting", "stopping"
+
+STATE_STYLE = {
+    ONLINE: ("🟢 オンライン", discord.Color.green()),
+    OFFLINE: ("🔴 オフライン", discord.Color.red()),
+    STARTING: ("🟡 起動中", discord.Color.gold()),
+    STOPPING: ("🟡 停止中", discord.Color.gold()),
+}
+
+LIST_RE = re.compile(r"There are (\d+) of a max(?: of)? (\d+) players online:?(.*)", re.S)
+COLOR_CODE_RE = re.compile(r"§.")
+
+
+@dataclass
+class ServerInfo:
+    state: str
+    count: int | None = None
+    max_players: int | None = None
+    players: list[str] = field(default_factory=list)
+    players_ok: bool = False
+
+
+async def unit_state() -> str:
+    """systemd の状態（active / activating / deactivating / inactive / failed ...）"""
+    _, out = await systemctl("is-active", SERVICE_NAME)
+    return out.splitlines()[0] if out else "unknown"
+
+
+async def server_info() -> ServerInfo:
+    unit = await unit_state()
+    if unit == "deactivating":
+        return ServerInfo(STOPPING)
+    if unit == "activating":
+        return ServerInfo(STARTING)
+    if unit != "active":
+        return ServerInfo(OFFLINE)
+    # The service is up, but the world isn't ready until RCON answers.
+    try:
+        out = await rcon_command("list")
+    except OSError:  # connection refused / timeout: still booting
+        return ServerInfo(STARTING)
+    except Exception:  # wrong password etc.: running, but no player info
+        return ServerInfo(ONLINE)
+    m = LIST_RE.search(COLOR_CODE_RE.sub("", out))
+    if not m:
+        return ServerInfo(ONLINE)
+    names = [n.strip() for n in m.group(3).split(",") if n.strip()]
+    return ServerInfo(ONLINE, int(m.group(1)), int(m.group(2)), names, True)
+
+
+async def build_panel() -> tuple[discord.Embed, PanelView, str]:
+    info = await server_info()
+    cpu = await asyncio.to_thread(psutil.cpu_percent, 1)
+    mem = psutil.virtual_memory()
+    label, color = STATE_STYLE[info.state]
+
+    embed = discord.Embed(title="🎮 Minecraft サーバー管理パネル", color=color)
+    embed.add_field(name="ステータス", value=label, inline=True)
+
+    if info.count is not None:
+        count = f"{info.count} / {info.max_players} 人"
+    else:
+        count = "-"
+    embed.add_field(name="オンライン人数", value=count, inline=True)
+
+    if info.state != ONLINE:
+        players = "-"
+    elif not info.players_ok:
+        players = "取得できませんでした"
+    else:
+        players = "\n".join(info.players) or "なし"
+    embed.add_field(name="接続中のプレイヤー", value=players[:1024], inline=False)
+
+    embed.add_field(
+        name="ラズパイ",
+        value=f"🌡️ {temp_label(cpu_temp())} ・ CPU {cpu:.0f}% ・ メモリ {mem.percent:.0f}%",
+        inline=False,
+    )
+    if SERVER_ADDRESS:
+        addr = f"`{SERVER_ADDRESS}` / ポート `{SERVER_PORT}`"
+    else:
+        addr = "未設定"
+    embed.add_field(name="接続先", value=addr, inline=False)
+
+    embed.set_footer(text="最終更新")
+    embed.timestamp = discord.utils.utcnow()
+    return embed, PanelView(info.state), info.state
+
+
+def load_panel() -> tuple[int, int] | None:
+    try:
+        data = json.loads(PANEL_FILE.read_text())
+        return int(data["channel_id"]), int(data["message_id"])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError, TypeError):
+        log.warning("panel.json を読み込めませんでした")
+        return None
+
+
+def save_panel(channel_id: int, message_id: int) -> None:
+    tmp = PANEL_FILE.with_name(PANEL_FILE.name + ".tmp")
+    tmp.write_text(json.dumps({"channel_id": channel_id, "message_id": message_id}))
+    tmp.replace(PANEL_FILE)
+
+
+def clear_panel() -> None:
+    PANEL_FILE.unlink(missing_ok=True)
+
+
+def is_panel_admin(interaction: discord.Interaction) -> bool:
+    """パネルの停止・再起動・ボット再起動と /panel は ADMIN_IDS の人だけ（空なら誰も使えない）"""
+    return interaction.user.id in ADMIN_IDS
+
+
+# ---------------------------------------------------------------- panel view
+
+class PanelView(discord.ui.View):
+    """Persistent view: timeout=None and fixed custom_ids keep buttons working after a restart."""
+
+    def __init__(self, state: str | None = None) -> None:
+        super().__init__(timeout=None)
+        if state is not None:
+            self.start_button.disabled = state != OFFLINE
+            self.stop_button.disabled = state in (OFFLINE, STOPPING)
+            self.restart_button.disabled = state in (OFFLINE, STOPPING)
+
+    async def _deny(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message("このボタンは管理者だけが使えます。", ephemeral=True)
+
+    @discord.ui.button(label="起動", emoji="▶️", style=discord.ButtonStyle.success,
+                       custom_id="mcpanel:start", row=0)
+    async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        unit = await unit_state()
+        if unit in ("active", "activating", "deactivating"):
+            msg = "停止処理中です。止まってから押してください。" if unit == "deactivating" else "サーバーはすでに起動しています。"
+            await interaction.response.send_message(msg, ephemeral=True)
+            bot.panel_fast()
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        bot.panel_fast()
+        code, out = await systemctl("start", SERVICE_NAME)
+        bot.panel_fast()
+        if code != 0:
+            await interaction.followup.send(f"起動に失敗しました。\n```\n{out[:1500]}\n```", ephemeral=True)
+            return
+        await interaction.followup.send(
+            "🟢 起動を開始しました。入れるようになるまで1分ほど待ってください。", ephemeral=True
+        )
+
+    @discord.ui.button(label="停止", emoji="⏹️", style=discord.ButtonStyle.danger,
+                       custom_id="mcpanel:stop", row=0)
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not is_panel_admin(interaction):
+            await self._deny(interaction)
+            return
+        if await unit_state() not in ("active", "activating"):
+            await interaction.response.send_message("サーバーは起動していません。", ephemeral=True)
+            bot.panel_fast()
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        bot.panel_fast()
+        code, out = await systemctl("stop", SERVICE_NAME)
+        bot.panel_fast()
+        if code != 0:
+            await interaction.followup.send(f"停止に失敗しました。\n```\n{out[:1500]}\n```", ephemeral=True)
+            return
+        await interaction.followup.send("🔴 サーバーを停止しました。ワールドは保存済みです。", ephemeral=True)
+
+    @discord.ui.button(label="再起動", emoji="🔄", style=discord.ButtonStyle.primary,
+                       custom_id="mcpanel:restart", row=0)
+    async def restart_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not is_panel_admin(interaction):
+            await self._deny(interaction)
+            return
+        if await unit_state() not in ("active", "activating"):
+            await interaction.response.send_message(
+                "サーバーは起動していません。「起動」ボタンを使ってください。", ephemeral=True
+            )
+            bot.panel_fast()
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        bot.panel_fast()
+        code, out = await systemctl("restart", SERVICE_NAME)
+        bot.panel_fast()
+        if code != 0:
+            await interaction.followup.send(f"再起動に失敗しました。\n```\n{out[:1500]}\n```", ephemeral=True)
+            return
+        await interaction.followup.send(
+            "🔄 サーバーを再起動しました。入れるようになるまで1分ほど待ってください。", ephemeral=True
+        )
+
+    @discord.ui.button(label="更新", emoji="🔃", style=discord.ButtonStyle.secondary,
+                       custom_id="mcpanel:refresh", row=1)
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer()
+        await bot.refresh_panel(extra=interaction.message)
+
+    @discord.ui.button(label="ボット再起動", emoji="🤖", style=discord.ButtonStyle.secondary,
+                       custom_id="mcpanel:botrestart", row=1)
+    async def bot_restart_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not is_panel_admin(interaction):
+            await self._deny(interaction)
+            return
+        await interaction.response.send_message(
+            "🤖 ボットを再起動します。10秒ほどで戻ってきます。", ephemeral=True
+        )
+        log.info("panel: bot restart requested by %s", interaction.user.id)
+        # --no-block: systemd carries out the restart even though it kills this process.
+        await systemctl("restart", "--no-block", BOT_SERVICE)
+
+
 # ---------------------------------------------------------------- bot
 
 class McBot(discord.Client):
@@ -164,12 +396,77 @@ class McBot(discord.Client):
         super().__init__(intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self)
         self.warned = False
+        self.panel_fast_since = 0.0
+        self.panel_fast_until = 0.0
+        self.panel_task: asyncio.Task | None = None
 
     async def setup_hook(self) -> None:
+        self.panel_wake = asyncio.Event()
+        self.panel_lock = asyncio.Lock()
+        self.add_view(PanelView())  # keep panel buttons working after a restart
         self.tree.copy_global_to(guild=GUILD)
         await self.tree.sync(guild=GUILD)
         if ALERT_CHANNEL_ID:
             self.temp_watch.start()
+        self.panel_task = asyncio.create_task(self.panel_loop())
+
+    # ------------------------------------------------------------ panel
+
+    def panel_fast(self) -> None:
+        """Refresh the panel now and then every few seconds until the state settles."""
+        now = time.monotonic()
+        self.panel_fast_since = now
+        self.panel_fast_until = now + PANEL_FAST_MAX
+        self.panel_wake.set()
+
+    async def panel_loop(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            self.panel_wake.clear()
+            try:
+                state = await self.refresh_panel()
+            except Exception:
+                log.exception("panel: refresh failed")
+                state = None
+            now = time.monotonic()
+            if (
+                self.panel_fast_until > now
+                and state in (ONLINE, OFFLINE)
+                and now - self.panel_fast_since >= PANEL_FAST_MIN
+            ):
+                self.panel_fast_until = 0.0
+            fast = self.panel_fast_until > now
+            try:
+                await asyncio.wait_for(
+                    self.panel_wake.wait(), PANEL_FAST_INTERVAL if fast else PANEL_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    async def refresh_panel(self, extra: discord.Message | None = None) -> str | None:
+        """Edit the saved panel message (and `extra`, if it is a different panel)."""
+        async with self.panel_lock:
+            saved = load_panel()
+            if saved is None and extra is None:
+                return None
+            embed, view, state = await build_panel()
+            if saved is not None:
+                channel_id, message_id = saved
+                try:
+                    channel = self.get_channel(channel_id) or await self.fetch_channel(channel_id)
+                    await channel.get_partial_message(message_id).edit(embed=embed, view=view)
+                except discord.NotFound:
+                    log.warning("panel: message %s was deleted; forgetting it", message_id)
+                    clear_panel()
+                    saved = None
+                except Exception:
+                    log.exception("panel: could not edit message %s", message_id)
+            if extra is not None and (saved is None or extra.id != saved[1]):
+                try:
+                    await extra.edit(embed=embed, view=PanelView(state))
+                except Exception:
+                    log.exception("panel: could not edit message %s", extra.id)
+            return state
 
     @tasks.loop(minutes=1)
     async def temp_watch(self) -> None:
@@ -295,6 +592,56 @@ async def cmd(interaction: discord.Interaction, command: str) -> None:
         await interaction.followup.send(f"実行できませんでした: {e}", ephemeral=True)
         return
     await interaction.followup.send(f"```\n{(result or '(出力なし)')[:1900]}\n```", ephemeral=True)
+
+
+@bot.tree.command(name="panel", description="このチャンネルにサーバー管理パネルを設置します（管理者のみ）")
+async def panel(interaction: discord.Interaction) -> None:
+    if not is_panel_admin(interaction):
+        await interaction.response.send_message("このコマンドは管理者だけが使えます。", ephemeral=True)
+        return
+    channel = interaction.channel
+    if channel is None or not hasattr(channel, "send"):
+        await interaction.response.send_message("このチャンネルには設置できません。", ephemeral=True)
+        return
+    perms = interaction.app_permissions
+    can_send = perms.send_messages_in_threads if isinstance(channel, discord.Thread) else perms.send_messages
+    missing = [
+        name for ok, name in (
+            (perms.view_channel, "チャンネルを見る"),
+            (can_send, "メッセージを送信"),
+            (perms.embed_links, "埋め込みリンク"),
+        ) if not ok
+    ]
+    if missing:
+        await interaction.response.send_message(
+            "ボットにこのチャンネルの権限が足りません: " + "、".join(missing), ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    async with bot.panel_lock:
+        embed, view, _ = await build_panel()
+        try:
+            message = await channel.send(embed=embed, view=view)
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"パネルを投稿できませんでした: {e}", ephemeral=True)
+            return
+        old = load_panel()
+        save_panel(channel.id, message.id)
+
+    note = ""
+    if old is not None and old[1] != message.id:
+        # Only one panel is kept up to date; remove the previous one.
+        try:
+            old_channel = bot.get_channel(old[0]) or await bot.fetch_channel(old[0])
+            await old_channel.get_partial_message(old[1]).delete()
+            note = "\n以前のパネルは削除しました。"
+        except discord.NotFound:
+            pass
+        except Exception:
+            log.exception("panel: could not delete old panel %s", old[1])
+            note = "\n以前のパネルは削除できなかったので、手動で消してください（もう更新されません）。"
+    await interaction.followup.send("✅ パネルを設置しました。30秒ごとに自動で更新されます。" + note, ephemeral=True)
 
 
 if __name__ == "__main__":

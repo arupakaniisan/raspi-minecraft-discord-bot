@@ -1060,7 +1060,7 @@ class McBot(discord.Client):
         names = normalize_name(raw)
         if names is None:
             return ("ユーザー名に使えない文字があります。英数字・「_」・スペースだけ、16文字までで入力してください。"
-                    "（マイクラ上の名前そのまま。「.」は付けても付けなくてもOKです）")
+                    "（マイクラ上の名前をそのまま入力してください）")
         orig, ingame = names
         uid = str(user.id)
         async with self.reg_lock:

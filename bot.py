@@ -81,7 +81,7 @@ MC_LOG_FILE = Path(os.path.expanduser(os.getenv("MC_LOG_FILE", "") or str(MC_DIR
 REGISTER_PANEL_FILE = Path(__file__).resolve().parent / "register_panel.json"
 REGISTRATIONS_FILE = Path(__file__).resolve().parent / "registrations.json"
 BEDROCK_PREFIX = "."          # floodgate username-prefix
-PENDING_TTL = 600             # seconds a "waiting for connection" request stays valid
+PENDING_TTL = 300             # seconds a "waiting for connection" request stays valid
 NOTICE_DELETE_AFTER = 300     # seconds until a channel-mention fallback notice is deleted
 
 GUILD = discord.Object(id=GUILD_ID)
@@ -92,6 +92,7 @@ BOT_SERVICE = "mcbot"
 # Where the panel's channel/message IDs are kept across restarts.
 PANEL_FILE = Path(__file__).resolve().parent / "panel.json"
 PANEL_INTERVAL = 30       # normal auto refresh (seconds)
+REGISTER_PANEL_INTERVAL = 60  # register panel auto refresh (seconds)
 PANEL_FAST_INTERVAL = 3   # refresh interval right after start/stop/restart
 PANEL_FAST_MIN = 10       # keep fast refresh at least this long after a button
 PANEL_FAST_MAX = 180      # ...and at most this long
@@ -362,7 +363,7 @@ async def build_panel() -> tuple[discord.Embed, PanelView, str]:
     elif not info.players_ok:
         players = "取得できませんでした"
     else:
-        players = "\n".join(info.players) or "なし"
+        players = "\n".join(show_name(n) for n in info.players) or "なし"
     embed.add_field(name="接続中のプレイヤー", value=players[:1024], inline=False)
 
     embed.add_field(
@@ -569,6 +570,11 @@ def normalize_name(raw: str) -> tuple[str, str] | None:
     return orig, BEDROCK_PREFIX + orig
 
 
+def show_name(name: str) -> str:
+    """Name as shown on Discord: without the floodgate prefix ('.')."""
+    return name[len(BEDROCK_PREFIX):] if name.startswith(BEDROCK_PREFIX) else name
+
+
 def write_json_atomic(path: Path, data, mode: int = 0o600) -> None:
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
@@ -701,6 +707,12 @@ async def build_register_panel() -> tuple[discord.Embed, "RegisterView"]:
     return embed, RegisterView()
 
 
+INVALID_NAME_MSG = (
+    "ユーザー名に使えない文字があります。英数字・「_」・スペースだけ、16文字までで入力してください。"
+    "（マイクラ上の名前をそのまま入力してください）"
+)
+
+
 class RegisterModal(discord.ui.Modal, title="参加登録"):
     username = discord.ui.TextInput(
         label="マイクラのユーザー名を入力してください",
@@ -709,13 +721,43 @@ class RegisterModal(discord.ui.Modal, title="参加登録"):
     )
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        raw = str(self.username.value)
+        names = normalize_name(raw)
+        if names is None:
+            await interaction.response.send_message(INVALID_NAME_MSG, ephemeral=True)
+            return
+        # Ask once more before anything is registered (typos are easy to make).
+        await interaction.response.send_message(
+            f"次の名前で登録します。合っていますか？\n\n## `{names[0]}`\n"
+            "間違えていたら「やり直す」を押してください。",
+            view=ConfirmRegisterView(raw), ephemeral=True,
+        )
+
+
+class ConfirmRegisterView(discord.ui.View):
+    """One-off confirmation shown (only to the user) after the name was typed."""
+
+    def __init__(self, raw: str) -> None:
+        super().__init__(timeout=180)
+        self.raw = raw
+
+    @discord.ui.button(label="この名前で登録する", style=discord.ButtonStyle.success)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="登録しています…", view=None)
         try:
-            msg = await bot.register(interaction.user, str(self.username.value))
+            msg = await bot.register(interaction.user, self.raw)
         except Exception:
             log.exception("register: failed")
             msg = "登録中にエラーが起きました。少し待ってからもう一度試してください。"
-        await interaction.followup.send(msg, ephemeral=True)
+        await interaction.edit_original_response(content=msg)
+
+    @discord.ui.button(label="やり直す", style=discord.ButtonStyle.secondary)
+    async def retry(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(
+            content="登録しませんでした。もう一度「参加登録」を押して、名前を入力してください。", view=None
+        )
 
 
 class RegisterView(discord.ui.View):
@@ -724,19 +766,38 @@ class RegisterView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Any button use: make sure the panel ends up as the last message of its channel
+        # (same as the admin panel).
+        if REGISTER_CHANNEL_ID and bot.reg_tasks:
+            bot.register_panel.request_repost(2, force=True)
+        return True
+
     @discord.ui.button(label="参加登録", emoji="🟢", style=discord.ButtonStyle.success,
                        custom_id="mcreg:join")
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_modal(RegisterModal())
 
+    @discord.ui.button(label="参加解除", emoji="🚪", style=discord.ButtonStyle.danger,
+                       custom_id="mcreg:leave")
+    async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        uid = str(interaction.user.id)
+        reg = bot.store.registrations.get(uid)
+        pend = bot.store.pending.get(uid)
+        if reg is None and pend is None:
+            await interaction.response.send_message("あなたの登録は見つかりませんでした。", ephemeral=True)
+            return
+        name = show_name((reg or pend)["name"])
+        what = "の登録を解除" if reg is not None else "の登録（接続待ち）を取り消し"
+        await interaction.response.send_message(
+            f"`{name}` {what}します。よろしいですか？\n"
+            "解除するとホワイトリストから外れ、このアカウントではサーバーに入れなくなります。",
+            view=ConfirmLeaveView(), ephemeral=True,
+        )
+
     @discord.ui.button(label="登録一覧", emoji="📋", style=discord.ButtonStyle.secondary,
                        custom_id="mcreg:list")
     async def list_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message(
-                "登録一覧は Discord サーバーの管理者だけが見られます。", ephemeral=True
-            )
-            return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             entries = await asyncio.to_thread(wl_read)
@@ -749,12 +810,12 @@ class RegisterView(discord.ui.View):
             linked_uuids.add(str(r.get("uuid", "")).lower())
             linked_names.add(r["name"].lower())
             note = "" if wl_find(entries, r["name"], r.get("uuid")) else "（ホワイトリストから外れています）"
-            lines.append(f"<@{uid}> → `{r['name']}`{note}")
+            lines.append(f"<@{uid}> → `{show_name(r['name'])}`{note}")
         for e in entries:
             if (str(e.get("uuid", "")).lower() in linked_uuids
                     or str(e.get("name", "")).lower() in linked_names):
                 continue
-            lines.append(f"Discord 未連携 → `{e.get('name', '?')}`")
+            lines.append(f"Discord 未連携 → `{show_name(str(e.get('name', '?')))}`")
         if not lines:
             await interaction.followup.send("まだ誰も登録していません。", ephemeral=True)
             return
@@ -772,6 +833,34 @@ class RegisterView(discord.ui.View):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+class ConfirmLeaveView(discord.ui.View):
+    """One-off confirmation (only visible to the user) before removing their own registration."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="解除する", style=discord.ButtonStyle.danger)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="解除しています…", view=None)
+        try:
+            name = await bot.unregister(interaction.user.id, "self (leave button)")
+        except Exception:
+            log.exception("leave: failed")
+            await interaction.edit_original_response(content="解除中にエラーが起きました。少し待ってからもう一度試してください。")
+            return
+        if name is None:
+            msg = "接続待ちの登録を取り消しました。"
+        else:
+            msg = f"`{show_name(name)}` の登録を解除しました。また遊ぶときは「参加登録」からもう一度登録してください。"
+        await interaction.edit_original_response(content=msg)
+
+    @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="解除しませんでした。", view=None)
+
+
 class StickyPanel:
     """A panel message that is edited in place and kept as the last message of its channel
     (same behaviour as the admin panel: saved message id, debounced re-send)."""
@@ -782,6 +871,7 @@ class StickyPanel:
         self.repost_task: asyncio.Task | None = None
         self.repost_first: float | None = None
         self.repost_at = 0.0
+        self.repost_force = False  # re-send even if the panel is already the last message
 
     def load(self) -> tuple[int, int] | None:
         try:
@@ -836,8 +926,10 @@ class StickyPanel:
             except Exception:
                 log.exception("register panel: could not delete old panel %s", old[1])
 
-    def request_repost(self, delay: float = PANEL_STICKY_DELAY) -> None:
+    def request_repost(self, delay: float = PANEL_STICKY_DELAY, force: bool = False) -> None:
         now = time.monotonic()
+        if force:
+            self.repost_force = True
         if self.repost_first is None:
             self.repost_first = now
         self.repost_at = min(now + delay, self.repost_first + PANEL_STICKY_MAX)
@@ -851,8 +943,9 @@ class StickyPanel:
                 await asyncio.sleep(wait)
                 continue
             self.repost_first = None
+            force, self.repost_force = self.repost_force, False
             try:
-                await self.place()
+                await self.place(force=force)
             except Exception:
                 log.exception("register panel: could not re-send the panel")
 
@@ -865,7 +958,7 @@ class McBot(discord.Client):
         # Privileged intent (must be ON in the Developer Portal): needed to notice members leaving.
         # MEMBERS_INTENT=0 starts the bot without it (leaving members are then not removed).
         intents.members = os.getenv("MEMBERS_INTENT", "1") != "0"
-        super().__init__(intents=intents)
+        super().__init__(intents=intents, max_messages=None)  # no message cache: only new messages matter
         self.tree = app_commands.CommandTree(self)
         self.warned = False
         self.panel_fast_since = 0.0
@@ -1059,8 +1152,7 @@ class McBot(discord.Client):
     async def register(self, user: discord.abc.User, raw: str) -> str:
         names = normalize_name(raw)
         if names is None:
-            return ("ユーザー名に使えない文字があります。英数字・「_」・スペースだけ、16文字までで入力してください。"
-                    "（マイクラ上の名前をそのまま入力してください）")
+            return INVALID_NAME_MSG
         orig, ingame = names
         uid = str(user.id)
         async with self.reg_lock:
@@ -1100,9 +1192,9 @@ class McBot(discord.Client):
             }
             self.store.save()
             return (
-                "10分以内に、マイクラから上のアドレスとポートでサーバーに一度接続してください。\n"
+                "5分以内に、マイクラから上のアドレスとポートでサーバーに一度接続してください。\n"
                 "ホワイトリストで弾かれますが、それで本人確認が完了します。\n"
-                f"（接続先: {addr_text()} ／ 登録する名前: `{ingame}`）"
+                f"（接続先: {addr_text()} ／ 登録する名前: `{orig}`）"
             )
 
     async def on_reject(self, name: str, uuid: str) -> None:
@@ -1225,7 +1317,7 @@ class McBot(discord.Client):
         except Exception:
             log.exception("register panel: could not place the panel in channel %s", REGISTER_CHANNEL_ID)
         while not self.is_closed():
-            await asyncio.sleep(PANEL_INTERVAL)
+            await asyncio.sleep(REGISTER_PANEL_INTERVAL)
             try:
                 await self.register_panel.refresh()
             except Exception:
@@ -1312,6 +1404,7 @@ async def status(interaction: discord.Interaction) -> None:
     if running:
         try:
             players = await rcon_command("list")
+            players = re.sub(r"(?<=: )\.|(?<=, )\.", "", players)  # hide the bedrock prefix
             embed.add_field(name="プレイヤー", value=players or "-", inline=False)
         except Exception:
             embed.add_field(name="プレイヤー", value="取得できませんでした（起動直後かもしれません）", inline=False)
@@ -1433,7 +1526,7 @@ async def unregister_cmd(interaction: discord.Interaction, user: discord.User) -
         await interaction.followup.send(f"{user.mention} の登録は見つかりませんでした。", ephemeral=True)
     else:
         await interaction.followup.send(
-            f"{user.mention} の `{name}` をホワイトリストから外しました。（遊んでいる最中の場合、退出するまでは入ったままです）",
+            f"{user.mention} の `{show_name(name)}` をホワイトリストから外しました。（遊んでいる最中の場合、退出するまでは入ったままです）",
             ephemeral=True,
         )
 

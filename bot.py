@@ -92,6 +92,7 @@ BOT_SERVICE = "mcbot"
 # Where the panel's channel/message IDs are kept across restarts.
 PANEL_FILE = Path(__file__).resolve().parent / "panel.json"
 PANEL_INTERVAL = 30       # normal auto refresh (seconds)
+REGISTER_PANEL_INTERVAL = 60  # register panel auto refresh (seconds)
 PANEL_FAST_INTERVAL = 3   # refresh interval right after start/stop/restart
 PANEL_FAST_MIN = 10       # keep fast refresh at least this long after a button
 PANEL_FAST_MAX = 180      # ...and at most this long
@@ -765,6 +766,13 @@ class RegisterView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Any button use: make sure the panel ends up as the last message of its channel
+        # (same as the admin panel).
+        if REGISTER_CHANNEL_ID and bot.reg_tasks:
+            bot.register_panel.request_repost(2, force=True)
+        return True
+
     @discord.ui.button(label="参加登録", emoji="🟢", style=discord.ButtonStyle.success,
                        custom_id="mcreg:join")
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -863,6 +871,7 @@ class StickyPanel:
         self.repost_task: asyncio.Task | None = None
         self.repost_first: float | None = None
         self.repost_at = 0.0
+        self.repost_force = False  # re-send even if the panel is already the last message
 
     def load(self) -> tuple[int, int] | None:
         try:
@@ -917,8 +926,10 @@ class StickyPanel:
             except Exception:
                 log.exception("register panel: could not delete old panel %s", old[1])
 
-    def request_repost(self, delay: float = PANEL_STICKY_DELAY) -> None:
+    def request_repost(self, delay: float = PANEL_STICKY_DELAY, force: bool = False) -> None:
         now = time.monotonic()
+        if force:
+            self.repost_force = True
         if self.repost_first is None:
             self.repost_first = now
         self.repost_at = min(now + delay, self.repost_first + PANEL_STICKY_MAX)
@@ -932,8 +943,9 @@ class StickyPanel:
                 await asyncio.sleep(wait)
                 continue
             self.repost_first = None
+            force, self.repost_force = self.repost_force, False
             try:
-                await self.place()
+                await self.place(force=force)
             except Exception:
                 log.exception("register panel: could not re-send the panel")
 
@@ -946,7 +958,7 @@ class McBot(discord.Client):
         # Privileged intent (must be ON in the Developer Portal): needed to notice members leaving.
         # MEMBERS_INTENT=0 starts the bot without it (leaving members are then not removed).
         intents.members = os.getenv("MEMBERS_INTENT", "1") != "0"
-        super().__init__(intents=intents)
+        super().__init__(intents=intents, max_messages=None)  # no message cache: only new messages matter
         self.tree = app_commands.CommandTree(self)
         self.warned = False
         self.panel_fast_since = 0.0
@@ -1305,7 +1317,7 @@ class McBot(discord.Client):
         except Exception:
             log.exception("register panel: could not place the panel in channel %s", REGISTER_CHANNEL_ID)
         while not self.is_closed():
-            await asyncio.sleep(PANEL_INTERVAL)
+            await asyncio.sleep(REGISTER_PANEL_INTERVAL)
             try:
                 await self.register_panel.refresh()
             except Exception:

@@ -770,14 +770,26 @@ class RegisterView(discord.ui.View):
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_modal(RegisterModal())
 
+    @discord.ui.button(label="参加解除", emoji="🔴", style=discord.ButtonStyle.danger,
+                       custom_id="mcreg:leave")
+    async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        uid = str(interaction.user.id)
+        reg = bot.store.registrations.get(uid)
+        pend = bot.store.pending.get(uid)
+        if reg is None and pend is None:
+            await interaction.response.send_message("あなたの登録は見つかりませんでした。", ephemeral=True)
+            return
+        name = show_name((reg or pend)["name"])
+        what = "の登録を解除" if reg is not None else "の登録（接続待ち）を取り消し"
+        await interaction.response.send_message(
+            f"`{name}` {what}します。よろしいですか？\n"
+            "解除するとホワイトリストから外れ、このアカウントではサーバーに入れなくなります。",
+            view=ConfirmLeaveView(), ephemeral=True,
+        )
+
     @discord.ui.button(label="登録一覧", emoji="📋", style=discord.ButtonStyle.secondary,
                        custom_id="mcreg:list")
     async def list_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message(
-                "登録一覧は Discord サーバーの管理者だけが見られます。", ephemeral=True
-            )
-            return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             entries = await asyncio.to_thread(wl_read)
@@ -811,6 +823,34 @@ class RegisterView(discord.ui.View):
             title=f"📋 登録一覧（{len(lines)} 件）", description=text, color=discord.Color.blurple()
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class ConfirmLeaveView(discord.ui.View):
+    """One-off confirmation (only visible to the user) before removing their own registration."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="解除する", style=discord.ButtonStyle.danger)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="解除しています…", view=None)
+        try:
+            name = await bot.unregister(interaction.user.id, "self (leave button)")
+        except Exception:
+            log.exception("leave: failed")
+            await interaction.edit_original_response(content="解除中にエラーが起きました。少し待ってからもう一度試してください。")
+            return
+        if name is None:
+            msg = "接続待ちの登録を取り消しました。"
+        else:
+            msg = f"`{show_name(name)}` の登録を解除しました。また遊ぶときは「参加登録」からもう一度登録してください。"
+        await interaction.edit_original_response(content=msg)
+
+    @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="解除しませんでした。", view=None)
 
 
 class StickyPanel:

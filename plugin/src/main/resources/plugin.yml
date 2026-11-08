@@ -1,0 +1,5 @@
+name: McbotWhitelist
+version: 1.0.0
+main: mcbot.McbotWhitelist
+api-version: "1.21"
+description: Logs players rejected by the whitelist (name + UUID) for the Discord bot.

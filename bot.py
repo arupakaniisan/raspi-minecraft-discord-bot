@@ -770,7 +770,7 @@ class RegisterView(discord.ui.View):
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_modal(RegisterModal())
 
-    @discord.ui.button(label="参加解除", emoji="🔴", style=discord.ButtonStyle.danger,
+    @discord.ui.button(label="参加解除", emoji="🚪", style=discord.ButtonStyle.danger,
                        custom_id="mcreg:leave")
     async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         uid = str(interaction.user.id)

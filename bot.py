@@ -1162,7 +1162,7 @@ class McBot(discord.Client):
                 return ("その名前はすでにホワイトリストに入っています（管理者が登録した名前など）。"
                         "自分の名前なのに登録できない場合は、管理者に連絡してください。")
             if same_as_cur and existing is not None:
-                return f"すでにこの名前（`{ingame}`）で登録済みです。上のアドレスとポートで接続してください。"
+                return f"すでにこの名前（`{orig}`）で登録済みです。上のアドレスとポートで接続してください。"
 
             try:
                 await rcon_command(f"fwhitelist add {orig}")

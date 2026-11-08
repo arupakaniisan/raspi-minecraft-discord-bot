@@ -3,6 +3,8 @@
 Slash commands:
   /start   Start the Minecraft server (systemd user service)
   /stop    Stop the Minecraft server (saves the world first)
+  /restart    Restart the Minecraft server
+  /botrestart Restart this bot
   /status  Show whether the server is running and who is online
   /pc      Show Raspberry Pi temperature, CPU, memory and disk usage
   /cmd     Run a server console command via RCON (admins only)
@@ -1401,6 +1403,33 @@ async def stop(interaction: discord.Interaction) -> None:
         await interaction.followup.send(f"停止に失敗しました。\n```\n{out[:1500]}\n```")
         return
     await interaction.followup.send(f"🔴 {interaction.user.display_name} さんがサーバーを停止しました。ワールドは保存済みです。")
+
+
+@bot.tree.command(name="restart", description="マイクラサーバーを再起動します（保存してから再起動します）")
+async def restart(interaction: discord.Interaction) -> None:
+    if await unit_state() not in ("active", "activating"):
+        await interaction.response.send_message("サーバーは起動していません。`/start` を使ってください。")
+        return
+    await interaction.response.defer(thinking=True)
+    bot.panel_fast()
+    code, out = await systemctl("restart", SERVICE_NAME)
+    bot.panel_fast()
+    if code != 0:
+        await interaction.followup.send(f"再起動に失敗しました。\n```\n{out[:1500]}\n```")
+        return
+    await interaction.followup.send(
+        f"🔄 {interaction.user.display_name} さんがサーバーを再起動しました。入れるようになるまで1分ほど待ってください。"
+    )
+
+
+@bot.tree.command(name="botrestart", description="このボットを再起動します（10秒ほどで戻ります）")
+async def botrestart(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(
+        f"🤖 {interaction.user.display_name} さんがボットを再起動しました。10秒ほどで戻ってきます。"
+    )
+    log.info("command: bot restart requested by %s", interaction.user.id)
+    # --no-block: systemd carries out the restart even though it kills this process.
+    await systemctl("restart", "--no-block", BOT_SERVICE)
 
 
 @bot.tree.command(name="status", description="サーバーの状態と接続中のプレイヤーを表示します")

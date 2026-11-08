@@ -422,15 +422,15 @@ class PanelView(discord.ui.View):
             await interaction.response.send_message(msg, ephemeral=True)
             bot.panel_fast()
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer(thinking=True)
         bot.panel_fast()
         code, out = await systemctl("start", SERVICE_NAME)
         bot.panel_fast()
         if code != 0:
-            await interaction.followup.send(f"起動に失敗しました。\n```\n{out[:1500]}\n```", ephemeral=True)
+            await interaction.followup.send(f"起動に失敗しました。\n```\n{out[:1500]}\n```")
             return
         await interaction.followup.send(
-            "🟢 起動を開始しました。入れるようになるまで1分ほど待ってください。", ephemeral=True
+            f"🟢 {interaction.user.display_name} さんがサーバーを起動しました。入れるようになるまで1分ほど待ってください。"
         )
 
     @discord.ui.button(label="停止", emoji="⏹️", style=discord.ButtonStyle.danger,
@@ -443,14 +443,14 @@ class PanelView(discord.ui.View):
             await interaction.response.send_message("サーバーは起動していません。", ephemeral=True)
             bot.panel_fast()
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer(thinking=True)
         bot.panel_fast()
         code, out = await systemctl("stop", SERVICE_NAME)
         bot.panel_fast()
         if code != 0:
-            await interaction.followup.send(f"停止に失敗しました。\n```\n{out[:1500]}\n```", ephemeral=True)
+            await interaction.followup.send(f"停止に失敗しました。\n```\n{out[:1500]}\n```")
             return
-        await interaction.followup.send("🔴 サーバーを停止しました。ワールドは保存済みです。", ephemeral=True)
+        await interaction.followup.send(f"🔴 {interaction.user.display_name} さんがサーバーを停止しました。ワールドは保存済みです。")
 
     @discord.ui.button(label="再起動", emoji="🔄", style=discord.ButtonStyle.primary,
                        custom_id="mcpanel:restart", row=0)
@@ -464,15 +464,15 @@ class PanelView(discord.ui.View):
             )
             bot.panel_fast()
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer(thinking=True)
         bot.panel_fast()
         code, out = await systemctl("restart", SERVICE_NAME)
         bot.panel_fast()
         if code != 0:
-            await interaction.followup.send(f"再起動に失敗しました。\n```\n{out[:1500]}\n```", ephemeral=True)
+            await interaction.followup.send(f"再起動に失敗しました。\n```\n{out[:1500]}\n```")
             return
         await interaction.followup.send(
-            "🔄 サーバーを再起動しました。入れるようになるまで1分ほど待ってください。", ephemeral=True
+            f"🔄 {interaction.user.display_name} さんがサーバーを再起動しました。入れるようになるまで1分ほど待ってください。"
         )
 
     @discord.ui.button(label="更新", emoji="🔃", style=discord.ButtonStyle.secondary,
@@ -488,7 +488,7 @@ class PanelView(discord.ui.View):
             await self._deny(interaction)
             return
         await interaction.response.send_message(
-            "🤖 ボットを再起動します。10秒ほどで戻ってきます。", ephemeral=True
+            f"🤖 {interaction.user.display_name} さんがボットを再起動しました。10秒ほどで戻ってきます。"
         )
         log.info("panel: bot restart requested by %s", interaction.user.id)
         # --no-block: systemd carries out the restart even though it kills this process.
@@ -508,7 +508,7 @@ class PanelView(discord.ui.View):
             bot.panel_wake.set()  # re-render the panel so the menu goes back to its placeholder
             return
         new = int(select.values[0])
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer(thinking=True)
         try:
             async with bot.vd_lock:
                 old, _backup = await asyncio.to_thread(write_view_distance, new)
@@ -524,11 +524,11 @@ class PanelView(discord.ui.View):
         finally:
             bot.panel_wake.set()
         if old == new:
-            await interaction.followup.send(f"描画距離はすでに {new} です。", ephemeral=True)
+            await interaction.followup.send(f"描画距離はすでに {new} です。")
             return
         log.info("view-distance: %s -> %s by %s", old, new, interaction.user.id)
         await interaction.followup.send(
-            f"描画距離を {old} → {new} に変更しました。再起動で反映されます", ephemeral=True
+            f"{interaction.user.display_name} さんが描画距離を {old} → {new} に変更しました。再起動で反映されます"
         )
 
 

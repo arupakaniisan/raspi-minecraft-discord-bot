@@ -1,4 +1,5 @@
 # raspi-minecraft-discord-bot
+<img width="464" height="299" alt="スクリーンショット 2026-11-09 003413" src="https://github.com/user-attachments/assets/2dc514d2-eec5-4624-9aec-a008df395d12" />
 
 Raspberry Pi 5 で動かしているマイクラサーバー（Paper + Geyser）を、Discord から起動・停止・監視するボットです。
 

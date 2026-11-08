@@ -409,7 +409,7 @@ def clear_panel() -> None:
 
 
 def is_panel_admin(interaction: discord.Interaction) -> bool:
-    """パネルの停止・再起動・ボット再起動と /panel は ADMIN_IDS の人だけ（空なら誰も使えない）"""
+    """/panel は ADMIN_IDS の人だけ（空なら誰も使えない）。パネルのボタンは全員が使える"""
     return interaction.user.id in ADMIN_IDS
 
 
@@ -430,9 +430,6 @@ class PanelView(discord.ui.View):
         if PANEL_CHANNEL_ID:
             bot.request_repost(2)
         return True
-
-    async def _deny(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message("このボタンは管理者だけが使えます。", ephemeral=True)
 
     @discord.ui.button(label="起動", emoji="▶️", style=discord.ButtonStyle.success,
                        custom_id="mcpanel:start", row=0)
@@ -457,9 +454,6 @@ class PanelView(discord.ui.View):
     @discord.ui.button(label="停止", emoji="⏹️", style=discord.ButtonStyle.danger,
                        custom_id="mcpanel:stop", row=0)
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not is_panel_admin(interaction):
-            await self._deny(interaction)
-            return
         if await unit_state() not in ("active", "activating"):
             await interaction.response.send_message("サーバーは起動していません。", ephemeral=True)
             bot.panel_fast()
@@ -476,9 +470,6 @@ class PanelView(discord.ui.View):
     @discord.ui.button(label="再起動", emoji="🔄", style=discord.ButtonStyle.primary,
                        custom_id="mcpanel:restart", row=0)
     async def restart_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not is_panel_admin(interaction):
-            await self._deny(interaction)
-            return
         if await unit_state() not in ("active", "activating"):
             await interaction.response.send_message(
                 "サーバーは起動していません。「起動」ボタンを使ってください。", ephemeral=True
@@ -505,9 +496,6 @@ class PanelView(discord.ui.View):
     @discord.ui.button(label="ボット再起動", emoji="🤖", style=discord.ButtonStyle.secondary,
                        custom_id="mcpanel:botrestart", row=1)
     async def bot_restart_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not is_panel_admin(interaction):
-            await self._deny(interaction)
-            return
         await interaction.response.send_message(
             f"🤖 {interaction.user.display_name} さんがボットを再起動しました。10秒ほどで戻ってきます。"
         )

@@ -2,14 +2,17 @@
 
 Slash commands:
   /start   Start the Minecraft server (systemd user service)
+  /stop    Stop the Minecraft server (saves the world first)
   /status  Show whether the server is running and who is online
   /pc      Show Raspberry Pi temperature, CPU, memory and disk usage
   /cmd     Run a server console command via RCON (admins only)
+  /panel   Post a server control panel with buttons (admins only)
   /登録解除  Remove a member's Minecraft account from the whitelist (Discord administrators only)
 
-Control panel: the bot keeps a panel with start/stop/restart buttons as the last message of
-PANEL_CHANNEL_ID (re-sent at startup, when someone posts there, or when it was deleted).
-Its select menu changes view-distance in server.properties (Discord server administrators only).
+The panel also has a select menu to change view-distance in server.properties
+(Discord server administrators only). If PANEL_CHANNEL_ID is set, the panel is
+kept as the last message of that channel: when someone posts there, the old
+panel is deleted and a new one is sent at the bottom.
 
 Self-service whitelist: a second panel in REGISTER_CHANNEL_ID lets any member of the Discord
 server register their own Bedrock account (see the "registration" section below).
@@ -49,7 +52,7 @@ RCON_HOST = os.getenv("RCON_HOST", "127.0.0.1")
 RCON_PORT = int(os.getenv("RCON_PORT", "25575"))
 RCON_PASSWORD = os.getenv("RCON_PASSWORD", "")
 
-# Comma separated Discord user IDs allowed to use /cmd.
+# Comma separated Discord user IDs allowed to use /stop and /cmd.
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
 # Temperature alert (Celsius). Set ALERT_CHANNEL_ID to enable.
@@ -72,7 +75,7 @@ VIEW_DISTANCE_CHOICES = [
     (12, "12（重い・少人数向け）"),
 ]
 
-# Channel where the panel is kept at the bottom (0 = no panel).
+# Channel where the panel is kept at the bottom (0 = off: the panel stays where /panel put it).
 PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0") or 0)
 
 # Self-service whitelist registration (0 = off).
@@ -403,6 +406,11 @@ def save_panel(channel_id: int, message_id: int) -> None:
 
 def clear_panel() -> None:
     PANEL_FILE.unlink(missing_ok=True)
+
+
+def is_panel_admin(interaction: discord.Interaction) -> bool:
+    """/panel は ADMIN_IDS の人だけ（空なら誰も使えない）。パネルのボタンは全員が使える"""
+    return interaction.user.id in ADMIN_IDS
 
 
 # ---------------------------------------------------------------- panel view
@@ -971,8 +979,6 @@ class McBot(discord.Client):
             self.temp_watch.start()  # warnings need ALERT_CHANNEL_ID; the auto-stop works without it
         self.panel_task = asyncio.create_task(self.panel_loop())
         self.reg_tasks: list[asyncio.Task] = []
-        if not PANEL_CHANNEL_ID:
-            log.warning("PANEL_CHANNEL_ID が空です。管理パネルは設置されません")
         if REGISTER_CHANNEL_ID and REGISTER_CHANNEL_ID == PANEL_CHANNEL_ID:
             log.error("REGISTER_CHANNEL_ID と PANEL_CHANNEL_ID が同じです。別のチャンネルにしてください（登録機能は無効）")
         elif REGISTER_CHANNEL_ID:
@@ -1366,6 +1372,10 @@ class McBot(discord.Client):
 bot = McBot()
 
 
+def is_admin(interaction: discord.Interaction) -> bool:
+    return not ADMIN_IDS or interaction.user.id in ADMIN_IDS
+
+
 @bot.tree.command(name="start", description="マイクラサーバーを起動します")
 async def start(interaction: discord.Interaction) -> None:
     if await is_running():
@@ -1380,6 +1390,22 @@ async def start(interaction: discord.Interaction) -> None:
     if SERVER_ADDRESS:
         msg += f"\nアドレス: `{SERVER_ADDRESS}` ポート: `{SERVER_PORT}`"
     await interaction.followup.send(msg)
+
+
+@bot.tree.command(name="stop", description="マイクラサーバーを停止します（保存してから止めます）")
+async def stop(interaction: discord.Interaction) -> None:
+    if not is_admin(interaction):
+        await interaction.response.send_message("このコマンドは管理者だけが使えます。", ephemeral=True)
+        return
+    if not await is_running():
+        await interaction.response.send_message("サーバーはすでに停止しています。")
+        return
+    await interaction.response.defer(thinking=True)
+    code, out = await systemctl("stop", SERVICE_NAME)
+    if code != 0:
+        await interaction.followup.send(f"停止に失敗しました。\n```\n{out[:1500]}\n```")
+        return
+    await interaction.followup.send("🔴 サーバーを停止しました。ワールドは保存済みです。")
 
 
 @bot.tree.command(name="status", description="サーバーの状態と接続中のプレイヤーを表示します")
@@ -1448,6 +1474,56 @@ async def cmd(interaction: discord.Interaction, command: str) -> None:
         await interaction.followup.send(f"実行できませんでした: {e}", ephemeral=True)
         return
     await interaction.followup.send(f"```\n{(result or '(出力なし)')[:1900]}\n```", ephemeral=True)
+
+
+@bot.tree.command(name="panel", description="このチャンネルにサーバー管理パネルを設置します（管理者のみ）")
+async def panel(interaction: discord.Interaction) -> None:
+    if not is_panel_admin(interaction):
+        await interaction.response.send_message("このコマンドは管理者だけが使えます。", ephemeral=True)
+        return
+    channel = interaction.channel
+    if PANEL_CHANNEL_ID and (channel is None or channel.id != PANEL_CHANNEL_ID):
+        # The panel lives in PANEL_CHANNEL_ID; /panel just (re)sends it there.
+        try:
+            channel = await bot.panel_channel()
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                f"PANEL_CHANNEL_ID のチャンネル（{PANEL_CHANNEL_ID}）を開けませんでした。", ephemeral=True
+            )
+            return
+        perms = channel.permissions_for(channel.guild.me)
+    elif channel is None or not hasattr(channel, "send"):
+        await interaction.response.send_message("このチャンネルには設置できません。", ephemeral=True)
+        return
+    else:
+        perms = interaction.app_permissions
+    can_send = perms.send_messages_in_threads if isinstance(channel, discord.Thread) else perms.send_messages
+    missing = [
+        name for ok, name in (
+            (perms.view_channel, "チャンネルを見る"),
+            (can_send, "メッセージを送信"),
+            (perms.embed_links, "埋め込みリンク"),
+        ) if not ok
+    ]
+    if missing:
+        await interaction.response.send_message(
+            f"ボットに {channel.mention} の権限が足りません: " + "、".join(missing), ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        # Only one panel is kept up to date; the previous one is removed.
+        _, note = await bot.place_panel(channel, force=True)
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"パネルを投稿できませんでした: {e}", ephemeral=True)
+        return
+    msg = f"✅ {channel.mention} にパネルを設置しました。30秒ごとに自動で更新されます。"
+    if PANEL_CHANNEL_ID:
+        msg += "\nこのチャンネルに投稿があると、パネルは自動で一番下に送り直されます。"
+    if note:
+        msg += "\n" + note
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 @bot.tree.command(name="登録解除", description="ユーザーのマイクラアカウントをホワイトリストから外します（管理者のみ）")

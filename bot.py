@@ -3,10 +3,12 @@
 Slash commands:
   /start   Start the Minecraft server (systemd user service)
   /stop    Stop the Minecraft server (saves the world first)
+  /restart    Restart the Minecraft server
+  /botrestart Restart this bot
   /status  Show whether the server is running and who is online
   /pc      Show Raspberry Pi temperature, CPU, memory and disk usage
   /cmd     Run a server console command via RCON (admins only)
-  /panel   Post a server control panel with buttons (admins only)
+  /panel   Post (re-send) the server control panel with buttons
   /登録解除  Remove a member's Minecraft account from the whitelist (Discord administrators only)
 
 The panel also has a select menu to change view-distance in server.properties
@@ -52,7 +54,7 @@ RCON_HOST = os.getenv("RCON_HOST", "127.0.0.1")
 RCON_PORT = int(os.getenv("RCON_PORT", "25575"))
 RCON_PASSWORD = os.getenv("RCON_PASSWORD", "")
 
-# Comma separated Discord user IDs allowed to use /stop and /cmd.
+# Comma separated Discord user IDs allowed to use /cmd.
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
 # Temperature alert (Celsius). Set ALERT_CHANNEL_ID to enable.
@@ -408,11 +410,6 @@ def clear_panel() -> None:
     PANEL_FILE.unlink(missing_ok=True)
 
 
-def is_panel_admin(interaction: discord.Interaction) -> bool:
-    """/panel は ADMIN_IDS の人だけ（空なら誰も使えない）。パネルのボタンは全員が使える"""
-    return interaction.user.id in ADMIN_IDS
-
-
 # ---------------------------------------------------------------- panel view
 
 class PanelView(discord.ui.View):
@@ -492,6 +489,13 @@ class PanelView(discord.ui.View):
     async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer()
         await bot.refresh_panel(extra=interaction.message)
+
+    @discord.ui.button(label="ラズパイの状態", emoji="📊", style=discord.ButtonStyle.secondary,
+                       custom_id="mcpanel:pc", row=1)
+    async def pc_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        # Same as /pc, but only the person who pressed it sees the result (keeps the channel tidy).
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.followup.send(embed=await build_pc_embed(), ephemeral=True)
 
     @discord.ui.button(label="ボット再起動", emoji="🤖", style=discord.ButtonStyle.secondary,
                        custom_id="mcpanel:botrestart", row=1)
@@ -1372,10 +1376,6 @@ class McBot(discord.Client):
 bot = McBot()
 
 
-def is_admin(interaction: discord.Interaction) -> bool:
-    return not ADMIN_IDS or interaction.user.id in ADMIN_IDS
-
-
 @bot.tree.command(name="start", description="マイクラサーバーを起動します")
 async def start(interaction: discord.Interaction) -> None:
     if await is_running():
@@ -1394,9 +1394,6 @@ async def start(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="stop", description="マイクラサーバーを停止します（保存してから止めます）")
 async def stop(interaction: discord.Interaction) -> None:
-    if not is_admin(interaction):
-        await interaction.response.send_message("このコマンドは管理者だけが使えます。", ephemeral=True)
-        return
     if not await is_running():
         await interaction.response.send_message("サーバーはすでに停止しています。")
         return
@@ -1405,7 +1402,34 @@ async def stop(interaction: discord.Interaction) -> None:
     if code != 0:
         await interaction.followup.send(f"停止に失敗しました。\n```\n{out[:1500]}\n```")
         return
-    await interaction.followup.send("🔴 サーバーを停止しました。ワールドは保存済みです。")
+    await interaction.followup.send(f"🔴 {interaction.user.display_name} さんがサーバーを停止しました。ワールドは保存済みです。")
+
+
+@bot.tree.command(name="restart", description="マイクラサーバーを再起動します（保存してから再起動します）")
+async def restart(interaction: discord.Interaction) -> None:
+    if await unit_state() not in ("active", "activating"):
+        await interaction.response.send_message("サーバーは起動していません。`/start` を使ってください。")
+        return
+    await interaction.response.defer(thinking=True)
+    bot.panel_fast()
+    code, out = await systemctl("restart", SERVICE_NAME)
+    bot.panel_fast()
+    if code != 0:
+        await interaction.followup.send(f"再起動に失敗しました。\n```\n{out[:1500]}\n```")
+        return
+    await interaction.followup.send(
+        f"🔄 {interaction.user.display_name} さんがサーバーを再起動しました。入れるようになるまで1分ほど待ってください。"
+    )
+
+
+@bot.tree.command(name="botrestart", description="このボットを再起動します（10秒ほどで戻ります）")
+async def botrestart(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(
+        f"🤖 {interaction.user.display_name} さんがボットを再起動しました。10秒ほどで戻ってきます。"
+    )
+    log.info("command: bot restart requested by %s", interaction.user.id)
+    # --no-block: systemd carries out the restart even though it kills this process.
+    await systemctl("restart", "--no-block", BOT_SERVICE)
 
 
 @bot.tree.command(name="status", description="サーバーの状態と接続中のプレイヤーを表示します")
@@ -1431,6 +1455,11 @@ async def status(interaction: discord.Interaction) -> None:
 @bot.tree.command(name="pc", description="ラズパイの温度・CPU・メモリを表示します")
 async def pc(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True)
+    await interaction.followup.send(embed=await build_pc_embed())
+
+
+async def build_pc_embed() -> discord.Embed:
+    """Raspberry Pi status (used by /pc and the panel button)."""
     cpu = await asyncio.to_thread(psutil.cpu_percent, 1)
     mem = psutil.virtual_memory()
     disk = psutil.disk_usage("/")
@@ -1455,7 +1484,7 @@ async def pc(interaction: discord.Interaction) -> None:
     )
     embed.add_field(name="性能制限", value=throttled(), inline=True)
     embed.set_footer(text="負荷は4を超えると重い状態の目安（4コア）")
-    await interaction.followup.send(embed=embed)
+    return embed
 
 
 @bot.tree.command(name="cmd", description="サーバーのコンソールコマンドを実行します（管理者のみ）")
@@ -1476,11 +1505,8 @@ async def cmd(interaction: discord.Interaction, command: str) -> None:
     await interaction.followup.send(f"```\n{(result or '(出力なし)')[:1900]}\n```", ephemeral=True)
 
 
-@bot.tree.command(name="panel", description="このチャンネルにサーバー管理パネルを設置します（管理者のみ）")
+@bot.tree.command(name="panel", description="サーバー管理パネルを設置し直します")
 async def panel(interaction: discord.Interaction) -> None:
-    if not is_panel_admin(interaction):
-        await interaction.response.send_message("このコマンドは管理者だけが使えます。", ephemeral=True)
-        return
     channel = interaction.channel
     if PANEL_CHANNEL_ID and (channel is None or channel.id != PANEL_CHANNEL_ID):
         # The panel lives in PANEL_CHANNEL_ID; /panel just (re)sends it there.

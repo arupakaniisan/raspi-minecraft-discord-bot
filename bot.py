@@ -82,7 +82,7 @@ REGISTER_PANEL_FILE = Path(__file__).resolve().parent / "register_panel.json"
 REGISTRATIONS_FILE = Path(__file__).resolve().parent / "registrations.json"
 BEDROCK_PREFIX = "."          # floodgate username-prefix
 PENDING_TTL = 300             # seconds a "waiting for connection" request stays valid
-NOTICE_DELETE_AFTER = 300     # seconds until a channel-mention fallback notice is deleted
+NOTICE_DELETE_AFTER = 300     # seconds until a registration notice in the register channel is deleted
 
 GUILD = discord.Object(id=GUILD_ID)
 
@@ -1120,15 +1120,7 @@ class McBot(discord.Client):
     # ------------------------------------------------------------ self-service registration
 
     async def notify_user(self, user_id: int, text: str) -> None:
-        """DM the user; if DMs are closed, mention them in the register channel and delete it later."""
-        try:
-            user = self.get_user(user_id) or await self.fetch_user(user_id)
-            await user.send(text)
-            return
-        except (discord.Forbidden, discord.NotFound):
-            pass
-        except Exception:
-            log.exception("register: DM to %s failed", user_id)
+        """Mention the user in the register channel; the notice is deleted after NOTICE_DELETE_AFTER."""
         try:
             channel = await self.register_panel.channel()
             await channel.send(

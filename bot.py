@@ -7,6 +7,9 @@ Slash commands:
   /pc      Show Raspberry Pi temperature, CPU, memory and disk usage
   /cmd     Run a server console command via RCON (admins only)
   /panel   Post a server control panel with buttons (admins only)
+
+If PANEL_CHANNEL_ID is set, the panel is kept as the last message of that channel:
+when someone posts there, the old panel is deleted and a new one is sent at the bottom.
 """
 
 from __future__ import annotations
@@ -48,6 +51,9 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0") or 0)
 TEMP_WARN = float(os.getenv("TEMP_WARN", "75"))
 
+# Channel where the panel is kept at the bottom (0 = off: the panel stays where /panel put it).
+PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0") or 0)
+
 GUILD = discord.Object(id=GUILD_ID)
 
 # The bot's own systemd user service (used by the panel's "bot restart" button).
@@ -59,6 +65,8 @@ PANEL_INTERVAL = 30       # normal auto refresh (seconds)
 PANEL_FAST_INTERVAL = 3   # refresh interval right after start/stop/restart
 PANEL_FAST_MIN = 10       # keep fast refresh at least this long after a button
 PANEL_FAST_MAX = 180      # ...and at most this long
+PANEL_STICKY_DELAY = 5    # re-send the panel this long after the last message in the channel
+PANEL_STICKY_MAX = 30     # ...but no later than this after the first one (busy chat)
 
 log = logging.getLogger("mcbot")
 
@@ -304,6 +312,12 @@ class PanelView(discord.ui.View):
             self.stop_button.disabled = state in (OFFLINE, STOPPING)
             self.restart_button.disabled = state in (OFFLINE, STOPPING)
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Any button/menu use: make sure the panel ends up as the last message of its channel.
+        if PANEL_CHANNEL_ID:
+            bot.request_repost(2)
+        return True
+
     async def _deny(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message("このボタンは管理者だけが使えます。", ephemeral=True)
 
@@ -388,7 +402,6 @@ class PanelView(discord.ui.View):
         # --no-block: systemd carries out the restart even though it kills this process.
         await systemctl("restart", "--no-block", BOT_SERVICE)
 
-
 # ---------------------------------------------------------------- bot
 
 class McBot(discord.Client):
@@ -399,6 +412,9 @@ class McBot(discord.Client):
         self.panel_fast_since = 0.0
         self.panel_fast_until = 0.0
         self.panel_task: asyncio.Task | None = None
+        self.repost_task: asyncio.Task | None = None
+        self.repost_first: float | None = None  # when the first not-yet-handled message came in
+        self.repost_at = 0.0
 
     async def setup_hook(self) -> None:
         self.panel_wake = asyncio.Event()
@@ -421,6 +437,12 @@ class McBot(discord.Client):
 
     async def panel_loop(self) -> None:
         await self.wait_until_ready()
+        if PANEL_CHANNEL_ID:
+            # Messages may have been posted while the bot was offline: put the panel back at the bottom.
+            try:
+                await self.place_panel(await self.panel_channel())
+            except Exception:
+                log.exception("panel: could not place the panel in channel %s", PANEL_CHANNEL_ID)
         while not self.is_closed():
             self.panel_wake.clear()
             try:
@@ -459,6 +481,8 @@ class McBot(discord.Client):
                     log.warning("panel: message %s was deleted; forgetting it", message_id)
                     clear_panel()
                     saved = None
+                    if PANEL_CHANNEL_ID:
+                        self.request_repost(0)
                 except Exception:
                     log.exception("panel: could not edit message %s", message_id)
             if extra is not None and (saved is None or extra.id != saved[1]):
@@ -467,6 +491,70 @@ class McBot(discord.Client):
                 except Exception:
                     log.exception("panel: could not edit message %s", extra.id)
             return state
+
+    # ------------------------------------------------------------ keep the panel at the bottom
+
+    async def panel_channel(self) -> discord.abc.Messageable:
+        return self.get_channel(PANEL_CHANNEL_ID) or await self.fetch_channel(PANEL_CHANNEL_ID)
+
+    async def place_panel(self, channel, force: bool = False) -> tuple[discord.Message | None, str]:
+        """Send a new panel to `channel` and delete the previous one.
+
+        Unless `force`, nothing happens if the saved panel is already the channel's last message.
+        Returns (new message or None, note about the old panel).
+        """
+        async with self.panel_lock:
+            old = load_panel()
+            if (
+                not force and old is not None and old[0] == channel.id
+                and channel.last_message_id == old[1]
+            ):
+                return None, ""
+            embed, view, _ = await build_panel()
+            # Send first, then delete: there is never a moment without a panel.
+            message = await channel.send(embed=embed, view=view)
+            save_panel(channel.id, message.id)
+        note = ""
+        if old is not None and old[1] != message.id:
+            try:
+                old_channel = self.get_channel(old[0]) or await self.fetch_channel(old[0])
+                await old_channel.get_partial_message(old[1]).delete()
+                note = "以前のパネルは削除しました。"
+            except discord.NotFound:
+                pass
+            except Exception:
+                log.exception("panel: could not delete old panel %s", old[1])
+                note = "以前のパネルは削除できなかったので、手動で消してください（もう更新されません）。"
+        return message, note
+
+    def request_repost(self, delay: float = PANEL_STICKY_DELAY) -> None:
+        """Debounced re-send: many messages in a row lead to a single re-send."""
+        now = time.monotonic()
+        if self.repost_first is None:
+            self.repost_first = now
+        self.repost_at = min(now + delay, self.repost_first + PANEL_STICKY_MAX)
+        if self.repost_task is None or self.repost_task.done():
+            self.repost_task = asyncio.create_task(self._repost_worker())
+
+    async def _repost_worker(self) -> None:
+        while self.repost_first is not None:
+            wait = self.repost_at - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+                continue
+            # Messages arriving from here on set repost_first again and get another round.
+            self.repost_first = None
+            try:
+                await self.place_panel(await self.panel_channel())
+            except Exception:
+                log.exception("panel: could not re-send the panel")
+
+    async def on_message(self, message: discord.Message) -> None:
+        if not PANEL_CHANNEL_ID or message.channel.id != PANEL_CHANNEL_ID:
+            return
+        if self.user is not None and message.author.id == self.user.id:
+            return  # our own messages (including the panel itself) don't trigger a re-send
+        self.request_repost()
 
     @tasks.loop(minutes=1)
     async def temp_watch(self) -> None:
@@ -600,10 +688,21 @@ async def panel(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("このコマンドは管理者だけが使えます。", ephemeral=True)
         return
     channel = interaction.channel
-    if channel is None or not hasattr(channel, "send"):
+    if PANEL_CHANNEL_ID and (channel is None or channel.id != PANEL_CHANNEL_ID):
+        # The panel lives in PANEL_CHANNEL_ID; /panel just (re)sends it there.
+        try:
+            channel = await bot.panel_channel()
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                f"PANEL_CHANNEL_ID のチャンネル（{PANEL_CHANNEL_ID}）を開けませんでした。", ephemeral=True
+            )
+            return
+        perms = channel.permissions_for(channel.guild.me)
+    elif channel is None or not hasattr(channel, "send"):
         await interaction.response.send_message("このチャンネルには設置できません。", ephemeral=True)
         return
-    perms = interaction.app_permissions
+    else:
+        perms = interaction.app_permissions
     can_send = perms.send_messages_in_threads if isinstance(channel, discord.Thread) else perms.send_messages
     missing = [
         name for ok, name in (
@@ -614,34 +713,23 @@ async def panel(interaction: discord.Interaction) -> None:
     ]
     if missing:
         await interaction.response.send_message(
-            "ボットにこのチャンネルの権限が足りません: " + "、".join(missing), ephemeral=True
+            f"ボットに {channel.mention} の権限が足りません: " + "、".join(missing), ephemeral=True
         )
         return
 
     await interaction.response.defer(ephemeral=True, thinking=True)
-    async with bot.panel_lock:
-        embed, view, _ = await build_panel()
-        try:
-            message = await channel.send(embed=embed, view=view)
-        except discord.HTTPException as e:
-            await interaction.followup.send(f"パネルを投稿できませんでした: {e}", ephemeral=True)
-            return
-        old = load_panel()
-        save_panel(channel.id, message.id)
-
-    note = ""
-    if old is not None and old[1] != message.id:
-        # Only one panel is kept up to date; remove the previous one.
-        try:
-            old_channel = bot.get_channel(old[0]) or await bot.fetch_channel(old[0])
-            await old_channel.get_partial_message(old[1]).delete()
-            note = "\n以前のパネルは削除しました。"
-        except discord.NotFound:
-            pass
-        except Exception:
-            log.exception("panel: could not delete old panel %s", old[1])
-            note = "\n以前のパネルは削除できなかったので、手動で消してください（もう更新されません）。"
-    await interaction.followup.send("✅ パネルを設置しました。30秒ごとに自動で更新されます。" + note, ephemeral=True)
+    try:
+        # Only one panel is kept up to date; the previous one is removed.
+        _, note = await bot.place_panel(channel, force=True)
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"パネルを投稿できませんでした: {e}", ephemeral=True)
+        return
+    msg = f"✅ {channel.mention} にパネルを設置しました。30秒ごとに自動で更新されます。"
+    if PANEL_CHANNEL_ID:
+        msg += "\nこのチャンネルに投稿があると、パネルは自動で一番下に送り直されます。"
+    if note:
+        msg += "\n" + note
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 if __name__ == "__main__":

@@ -58,6 +58,11 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 # Temperature alert (Celsius). Set ALERT_CHANNEL_ID to enable.
 ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0") or 0)
 TEMP_WARN = float(os.getenv("TEMP_WARN", "75"))
+# Stop the Minecraft server (world saved) when the CPU stays at or above this temperature
+# for TEMP_SHUTDOWN_COUNT checks in a row (checked every TEMP_CHECK_SECONDS). 0 = off.
+TEMP_SHUTDOWN = float(os.getenv("TEMP_SHUTDOWN", "85") or 0)
+TEMP_SHUTDOWN_COUNT = 3
+TEMP_CHECK_SECONDS = 30
 
 # server.properties of the Minecraft server (only the view-distance line is touched).
 SERVER_PROPERTIES = Path(
@@ -961,6 +966,7 @@ class McBot(discord.Client):
         super().__init__(intents=intents, max_messages=None)  # no message cache: only new messages matter
         self.tree = app_commands.CommandTree(self)
         self.warned = False
+        self.hot_count = 0  # consecutive checks at or above TEMP_SHUTDOWN
         self.panel_fast_since = 0.0
         self.panel_fast_until = 0.0
         self.panel_task: asyncio.Task | None = None
@@ -1326,20 +1332,49 @@ class McBot(discord.Client):
             return  # our own messages (including the panel itself) don't trigger a re-send
         self.request_repost()
 
-    @tasks.loop(minutes=1)
+    @tasks.loop(seconds=TEMP_CHECK_SECONDS)
     async def temp_watch(self) -> None:
         t = cpu_temp()
         if t is None:
             return
         channel = self.get_channel(ALERT_CHANNEL_ID)
-        if channel is None:
-            return
         if t >= TEMP_WARN and not self.warned:
             self.warned = True
-            await channel.send(f"⚠️ ラズパイのCPU温度が {t:.1f}℃ になっています。")
+            if channel is not None:
+                await channel.send(f"⚠️ ラズパイのCPU温度が {t:.1f}℃ になっています。")
         elif t < TEMP_WARN - 5 and self.warned:
             self.warned = False
-            await channel.send(f"✅ CPU温度が {t:.1f}℃ まで下がりました。")
+            if channel is not None:
+                await channel.send(f"✅ CPU温度が {t:.1f}℃ まで下がりました。")
+
+        # Overheat protection: stop the server once it has stayed too hot for a while.
+        if not TEMP_SHUTDOWN or t < TEMP_SHUTDOWN:
+            self.hot_count = 0
+            return
+        self.hot_count += 1
+        if self.hot_count < TEMP_SHUTDOWN_COUNT:
+            return
+        self.hot_count = 0
+        if await unit_state() not in ("active", "activating"):
+            return
+        log.warning("temp: %.1f C for %d checks, stopping %s", t, TEMP_SHUTDOWN_COUNT, SERVICE_NAME)
+        self.panel_fast()
+        code, out = await systemctl("stop", SERVICE_NAME)
+        self.panel_fast()
+        if channel is None:
+            return
+        if code != 0:
+            await channel.send(
+                f"🛑 CPU温度が {t:.1f}℃ の状態が続いたためサーバーを止めようとしましたが、失敗しました。\n"
+                f"```\n{out[:1500]}\n```"
+            )
+            return
+        secs = TEMP_SHUTDOWN_COUNT * TEMP_CHECK_SECONDS
+        await channel.send(
+            f"🛑 CPU温度が {TEMP_SHUTDOWN:.0f}℃ 以上の状態が約{secs}秒続いたため（今 {t:.1f}℃）、"
+            "サーバーを自動停止しました。ワールドは保存済みです。\n"
+            "温度が下がったのを確認してから、起動ボタンで起動してください。"
+        )
 
     @temp_watch.before_loop
     async def before_temp_watch(self) -> None:

@@ -40,7 +40,9 @@ Raspberry Pi 5 で動かしているマイクラサーバー（Paper + Geyser）
 - ボットには、そのチャンネルの「チャンネルを見る」「メッセージを送信」「埋め込みリンク」の権限が必要です
 - `ADMIN_IDS` が空だと、`/panel` と管理者用のボタンは誰も使えません
 
-`ALERT_CHANNEL_ID` を設定すると、CPU温度が `TEMP_WARN`（初期値75℃）を超えたときにそのチャンネルへ警告します。
+`ALERT_CHANNEL_ID` を設定すると、CPU温度が `TEMP_WARN`（初期値75℃）を超えたときにそのチャンネルへ警告します。温度は30秒ごとに確認します。
+
+**高温での自動停止**: CPU温度が `TEMP_SHUTDOWN`（初期値85℃）以上の状態が3回続く（約90秒）と、ワールドを保存してマイクラサーバーを自動で停止し、`ALERT_CHANNEL_ID` のチャンネルに知らせます。途中で一度でも下がれば数え直します。冷えても自動では起動しないので、温度を確認してから起動ボタンで起動してください。`TEMP_SHUTDOWN=0` で無効になります。
 
 ## 構成
 
@@ -121,6 +123,7 @@ systemctl --user enable --now mcbot
 | `SERVER_ADDRESS` / `SERVER_PORT` | `/start` と `/status` に表示する接続先 |
 | `RCON_PASSWORD` など | `server.properties` と同じ値 |
 | `ALERT_CHANNEL_ID` / `TEMP_WARN` | 温度警告の送り先と、警告する温度 |
+| `TEMP_SHUTDOWN` | この温度以上が約90秒続いたらサーバーを自動停止（初期値85、0で無効） |
 | `SERVER_PROPERTIES` | `server.properties` の場所（空なら `~/minecraft/server.properties`） |
 | `PANEL_CHANNEL_ID` | 管理パネルを置くチャンネルのID。設定すると、パネルが常に一番下になるように送り直されます |
 | `REGISTER_CHANNEL_ID` / `MC_DIR` など | ユーザー登録パネルのチャンネルと、サーバーのフォルダ（上の「ユーザー登録」参照） |

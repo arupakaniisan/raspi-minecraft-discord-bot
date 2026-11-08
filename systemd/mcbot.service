@@ -1,0 +1,12 @@
+[Unit]
+Description=Minecraft Discord control bot
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/raspi-minecraft-discord-bot
+ExecStart=%h/raspi-minecraft-discord-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

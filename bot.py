@@ -987,8 +987,8 @@ class McBot(discord.Client):
         self.add_view(RegisterView())
         self.tree.copy_global_to(guild=GUILD)
         await self.tree.sync(guild=GUILD)
-        if ALERT_CHANNEL_ID:
-            self.temp_watch.start()
+        if ALERT_CHANNEL_ID or TEMP_SHUTDOWN:
+            self.temp_watch.start()  # warnings need ALERT_CHANNEL_ID; the auto-stop works without it
         self.panel_task = asyncio.create_task(self.panel_loop())
         self.reg_tasks: list[asyncio.Task] = []
         if REGISTER_CHANNEL_ID and REGISTER_CHANNEL_ID == PANEL_CHANNEL_ID:

@@ -6,3 +6,8 @@ panel.json
 panel.json.tmp
 .env.*
 !.env.example
+plugin/build/
+register_panel.json
+register_panel.json.tmp
+registrations.json
+registrations.json.tmp

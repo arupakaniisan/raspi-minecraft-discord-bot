@@ -7,9 +7,15 @@ Slash commands:
   /pc      Show Raspberry Pi temperature, CPU, memory and disk usage
   /cmd     Run a server console command via RCON (admins only)
   /panel   Post a server control panel with buttons (admins only)
+  /登録解除  Remove a member's Minecraft account from the whitelist (Discord administrators only)
 
-If PANEL_CHANNEL_ID is set, the panel is kept as the last message of that channel:
-when someone posts there, the old panel is deleted and a new one is sent at the bottom.
+The panel also has a select menu to change view-distance in server.properties
+(Discord server administrators only). If PANEL_CHANNEL_ID is set, the panel is
+kept as the last message of that channel: when someone posts there, the old
+panel is deleted and a new one is sent at the bottom.
+
+Self-service whitelist: a second panel in REGISTER_CHANNEL_ID lets any member of the Discord
+server register their own Bedrock account (see the "registration" section below).
 """
 
 from __future__ import annotations
@@ -19,7 +25,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
+import stat
 import struct
 import subprocess
 import time
@@ -51,8 +59,30 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0") or 0)
 TEMP_WARN = float(os.getenv("TEMP_WARN", "75"))
 
+# server.properties of the Minecraft server (only the view-distance line is touched).
+SERVER_PROPERTIES = Path(
+    os.path.expanduser(os.getenv("SERVER_PROPERTIES", "") or "~/minecraft/server.properties")
+)
+VIEW_DISTANCE_CHOICES = [
+    (6, "6（軽い）"),
+    (8, "8（おすすめ）"),
+    (10, "10（4人くらいまで）"),
+    (12, "12（重い・少人数向け）"),
+]
+
 # Channel where the panel is kept at the bottom (0 = off: the panel stays where /panel put it).
 PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0") or 0)
+
+# Self-service whitelist registration (0 = off).
+REGISTER_CHANNEL_ID = int(os.getenv("REGISTER_CHANNEL_ID", "0") or 0)
+MC_DIR = Path(os.path.expanduser(os.getenv("MC_DIR", "") or "~/minecraft"))
+WHITELIST_FILE = Path(os.path.expanduser(os.getenv("WHITELIST_FILE", "") or str(MC_DIR / "whitelist.json")))
+MC_LOG_FILE = Path(os.path.expanduser(os.getenv("MC_LOG_FILE", "") or str(MC_DIR / "logs" / "latest.log")))
+REGISTER_PANEL_FILE = Path(__file__).resolve().parent / "register_panel.json"
+REGISTRATIONS_FILE = Path(__file__).resolve().parent / "registrations.json"
+BEDROCK_PREFIX = "."          # floodgate username-prefix
+PENDING_TTL = 600             # seconds a "waiting for connection" request stays valid
+NOTICE_DELETE_AFTER = 300     # seconds until a channel-mention fallback notice is deleted
 
 GUILD = discord.Object(id=GUILD_ID)
 
@@ -183,6 +213,64 @@ def temp_label(t: float | None) -> str:
     return f"{t:.1f}℃ ✅"
 
 
+# ---------------------------------------------------------------- server.properties
+
+# Matches the whole view-distance line; group 2 is the number. Works on bytes so that
+# every other byte of the file (comments, order, line endings, encoding) stays as is.
+VIEW_DISTANCE_RE = re.compile(rb"^([ \t]*view-distance[ \t]*[=:][ \t]*)(\d+)([ \t]*\r?)$", re.M)
+
+
+class PropertiesError(Exception):
+    pass
+
+
+def _find_view_distance(data: bytes) -> re.Match[bytes]:
+    matches = list(VIEW_DISTANCE_RE.finditer(data))
+    if not matches:
+        raise PropertiesError("server.properties に view-distance の行が見つかりません")
+    if len(matches) > 1:
+        raise PropertiesError("server.properties に view-distance の行が複数あります")
+    return matches[0]
+
+
+def read_view_distance() -> int:
+    return int(_find_view_distance(SERVER_PROPERTIES.read_bytes()).group(2))
+
+
+def write_view_distance(new: int) -> tuple[int, Path | None]:
+    """Rewrite only the number on the view-distance line. Returns (old value, backup path)."""
+    path = SERVER_PROPERTIES
+    data = path.read_bytes()
+    m = _find_view_distance(data)
+    old = int(m.group(2))
+    if old == new:
+        return old, None
+
+    # Same naming as the existing backups: server.properties.bak-YYYYMMDDHHMMSS
+    while True:
+        backup = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%d%H%M%S')}")
+        if not backup.exists():
+            break
+        time.sleep(1)  # never overwrite an older backup made in the same second
+    shutil.copy2(path, backup)  # keeps the 600 permission (the file holds rcon.password)
+
+    new_data = data[:m.start(2)] + str(new).encode() + data[m.end(2):]
+    mode = stat.S_IMODE(path.stat().st_mode)
+    tmp = path.with_name(path.name + ".mcbot-tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(new_data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)  # atomic: the file is never half written
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return old, backup
+
+
 # ---------------------------------------------------------------- panel state
 
 ONLINE, OFFLINE, STARTING, STOPPING = "online", "offline", "starting", "stopping"
@@ -249,6 +337,25 @@ async def build_panel() -> tuple[discord.Embed, PanelView, str]:
     else:
         count = "-"
     embed.add_field(name="オンライン人数", value=count, inline=True)
+
+    try:
+        vd = await asyncio.to_thread(read_view_distance)
+        bot.vd_error_logged = False
+    except Exception as e:
+        vd = None
+        if not bot.vd_error_logged:  # log once, and never the file's contents
+            bot.vd_error_logged = True
+            log.warning("panel: could not read view-distance: %s", type(e).__name__)
+    if vd is None:
+        vd_text = "取得できませんでした"
+    else:
+        # While the server is not running, whatever is in the file is what it will use.
+        if info.state != ONLINE or bot.vd_applied is None:
+            bot.vd_applied = vd
+        vd_text = str(vd)
+        if vd != bot.vd_applied:
+            vd_text += "（再起動で反映）"
+    embed.add_field(name="描画距離", value=vd_text, inline=True)
 
     if info.state != ONLINE:
         players = "-"
@@ -330,15 +437,15 @@ class PanelView(discord.ui.View):
             await interaction.response.send_message(msg, ephemeral=True)
             bot.panel_fast()
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer(thinking=True)
         bot.panel_fast()
         code, out = await systemctl("start", SERVICE_NAME)
         bot.panel_fast()
         if code != 0:
-            await interaction.followup.send(f"起動に失敗しました。\n```\n{out[:1500]}\n```", ephemeral=True)
+            await interaction.followup.send(f"起動に失敗しました。\n```\n{out[:1500]}\n```")
             return
         await interaction.followup.send(
-            "🟢 起動を開始しました。入れるようになるまで1分ほど待ってください。", ephemeral=True
+            f"🟢 {interaction.user.display_name} さんがサーバーを起動しました。入れるようになるまで1分ほど待ってください。"
         )
 
     @discord.ui.button(label="停止", emoji="⏹️", style=discord.ButtonStyle.danger,
@@ -351,14 +458,14 @@ class PanelView(discord.ui.View):
             await interaction.response.send_message("サーバーは起動していません。", ephemeral=True)
             bot.panel_fast()
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer(thinking=True)
         bot.panel_fast()
         code, out = await systemctl("stop", SERVICE_NAME)
         bot.panel_fast()
         if code != 0:
-            await interaction.followup.send(f"停止に失敗しました。\n```\n{out[:1500]}\n```", ephemeral=True)
+            await interaction.followup.send(f"停止に失敗しました。\n```\n{out[:1500]}\n```")
             return
-        await interaction.followup.send("🔴 サーバーを停止しました。ワールドは保存済みです。", ephemeral=True)
+        await interaction.followup.send(f"🔴 {interaction.user.display_name} さんがサーバーを停止しました。ワールドは保存済みです。")
 
     @discord.ui.button(label="再起動", emoji="🔄", style=discord.ButtonStyle.primary,
                        custom_id="mcpanel:restart", row=0)
@@ -372,15 +479,15 @@ class PanelView(discord.ui.View):
             )
             bot.panel_fast()
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer(thinking=True)
         bot.panel_fast()
         code, out = await systemctl("restart", SERVICE_NAME)
         bot.panel_fast()
         if code != 0:
-            await interaction.followup.send(f"再起動に失敗しました。\n```\n{out[:1500]}\n```", ephemeral=True)
+            await interaction.followup.send(f"再起動に失敗しました。\n```\n{out[:1500]}\n```")
             return
         await interaction.followup.send(
-            "🔄 サーバーを再起動しました。入れるようになるまで1分ほど待ってください。", ephemeral=True
+            f"🔄 {interaction.user.display_name} さんがサーバーを再起動しました。入れるようになるまで1分ほど待ってください。"
         )
 
     @discord.ui.button(label="更新", emoji="🔃", style=discord.ButtonStyle.secondary,
@@ -396,17 +503,369 @@ class PanelView(discord.ui.View):
             await self._deny(interaction)
             return
         await interaction.response.send_message(
-            "🤖 ボットを再起動します。10秒ほどで戻ってきます。", ephemeral=True
+            f"🤖 {interaction.user.display_name} さんがボットを再起動しました。10秒ほどで戻ってきます。"
         )
         log.info("panel: bot restart requested by %s", interaction.user.id)
         # --no-block: systemd carries out the restart even though it kills this process.
         await systemctl("restart", "--no-block", BOT_SERVICE)
 
+    @discord.ui.select(
+        custom_id="mcpanel:viewdistance",
+        placeholder="🔭 描画距離を変更（管理者のみ・再起動で反映）",
+        options=[discord.SelectOption(label=label, value=str(v)) for v, label in VIEW_DISTANCE_CHOICES],
+        row=2,
+    )
+    async def view_distance_select(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:
+        if not interaction.permissions.administrator:
+            await interaction.response.send_message(
+                "描画距離の変更は Discord サーバーの管理者だけができます。", ephemeral=True
+            )
+            bot.panel_wake.set()  # re-render the panel so the menu goes back to its placeholder
+            return
+        new = int(select.values[0])
+        await interaction.response.defer(thinking=True)
+        try:
+            async with bot.vd_lock:
+                old, _backup = await asyncio.to_thread(write_view_distance, new)
+        except PropertiesError as e:
+            await interaction.followup.send(f"変更できませんでした: {e}", ephemeral=True)
+            return
+        except Exception as e:
+            log.exception("view-distance: could not update %s", SERVER_PROPERTIES)
+            await interaction.followup.send(
+                f"変更できませんでした（{type(e).__name__}）。ボットのログを確認してください。", ephemeral=True
+            )
+            return
+        finally:
+            bot.panel_wake.set()
+        if old == new:
+            await interaction.followup.send(f"描画距離はすでに {new} です。")
+            return
+        log.info("view-distance: %s -> %s by %s", old, new, interaction.user.id)
+        await interaction.followup.send(
+            f"{interaction.user.display_name} さんが描画距離を {old} → {new} に変更しました。再起動で反映されます"
+        )
+
+
+# ---------------------------------------------------------------- registration
+
+# Written by the plugin in plugin/ for every connection the whitelist rejects.
+REJECT_RE = re.compile(
+    r"\[McbotWhitelist\] REJECT (\S+) "
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+FLOODGATE_UUID_PREFIX = "00000000-0000-0000-"
+USERNAME_RE = re.compile(r"[\w ]{1,16}")  # letters/digits/_/space only: also keeps RCON input safe
+
+
+def normalize_name(raw: str) -> tuple[str, str] | None:
+    """User input -> (original name for fwhitelist, in-server name with the prefix)."""
+    s = raw.strip()
+    if s.startswith(BEDROCK_PREFIX):
+        s = s[len(BEDROCK_PREFIX):].strip()
+    if not USERNAME_RE.fullmatch(s):
+        return None
+    orig = s.replace(" ", "_")  # floodgate: replace-spaces
+    return orig, BEDROCK_PREFIX + orig
+
+
+def write_json_atomic(path: Path, data, mode: int = 0o600) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+class RegStore:
+    """Who registered which account (registrations.json). Survives bot restarts."""
+
+    def __init__(self) -> None:
+        self.registrations: dict[str, dict] = {}  # discord id -> {"name", "uuid", "at"}
+        self.pending: dict[str, dict] = {}        # discord id -> {"name", "orig", "expires"}
+        try:
+            data = json.loads(REGISTRATIONS_FILE.read_text(encoding="utf-8"))
+            self.registrations = dict(data.get("registrations", {}))
+            self.pending = dict(data.get("pending", {}))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, AttributeError, TypeError):
+            log.warning("registrations.json を読み込めませんでした（空として扱います）")
+
+    def save(self) -> None:
+        write_json_atomic(
+            REGISTRATIONS_FILE, {"registrations": self.registrations, "pending": self.pending}
+        )
+
+    def owner_of_name(self, ingame: str) -> str | None:
+        for uid, r in self.registrations.items():
+            if r["name"].lower() == ingame.lower():
+                return uid
+        return None
+
+    def pending_owner_of_name(self, ingame: str) -> str | None:
+        now = time.time()
+        for uid, p in self.pending.items():
+            if p["name"].lower() == ingame.lower() and p["expires"] > now:
+                return uid
+        return None
+
+
+def wl_read() -> list[dict]:
+    try:
+        data = json.loads(WHITELIST_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    if not isinstance(data, list):
+        raise ValueError("whitelist.json is not a list")
+    return data
+
+
+def wl_write(entries: list[dict]) -> None:
+    try:
+        mode = stat.S_IMODE(WHITELIST_FILE.stat().st_mode)
+    except FileNotFoundError:
+        mode = 0o664
+    write_json_atomic(WHITELIST_FILE, entries, mode)
+
+
+def wl_find(entries: list[dict], name: str | None = None, uuid: str | None = None) -> dict | None:
+    for e in entries:
+        if (uuid and str(e.get("uuid", "")).lower() == uuid.lower()) or (
+            name and str(e.get("name", "")).lower() == name.lower()
+        ):
+            return e
+    return None
+
+
+async def wl_reload() -> None:
+    try:
+        await rcon_command("whitelist reload")
+    except Exception as e:
+        log.warning("whitelist reload failed: %s", type(e).__name__)
+
+
+async def wl_add(uuid: str, name: str) -> None:
+    """Put (uuid, name) into whitelist.json, then tell the server to re-read it."""
+    entries = [
+        e for e in wl_read()
+        if str(e.get("uuid", "")).lower() != uuid.lower()
+        and str(e.get("name", "")).lower() != name.lower()
+    ]
+    entries.append({"uuid": uuid, "name": name})
+    wl_write(entries)
+    await wl_reload()
+
+
+async def wl_remove(name: str | None, uuid: str | None) -> bool:
+    entries = wl_read()
+    keep = [
+        e for e in entries
+        if not ((uuid and str(e.get("uuid", "")).lower() == uuid.lower())
+                or (name and str(e.get("name", "")).lower() == name.lower()))
+    ]
+    if len(keep) == len(entries):
+        return False
+    wl_write(keep)
+    await wl_reload()
+    return True
+
+
+def addr_text() -> str:
+    return f"`{SERVER_ADDRESS}` / ポート `{SERVER_PORT}`" if SERVER_ADDRESS else "未設定"
+
+
+async def build_register_panel() -> tuple[discord.Embed, "RegisterView"]:
+    info = await server_info()
+    label, color = STATE_STYLE[info.state]
+    embed = discord.Embed(title="🎫 Minecraft 参加登録", color=color)
+    embed.add_field(name="ステータス", value=label, inline=False)
+    embed.add_field(name="接続先", value=addr_text(), inline=False)
+    embed.add_field(
+        name="参加までの手順",
+        value=(
+            "① 下の「🟢 参加登録」ボタンを押して、マイクラのユーザー名を入力\n"
+            "② マイクラの「サーバー」タブでサーバーを追加し、上のアドレスとポートで接続"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="最終更新")
+    embed.timestamp = discord.utils.utcnow()
+    return embed, RegisterView()
+
+
+class RegisterModal(discord.ui.Modal, title="参加登録"):
+    username = discord.ui.TextInput(
+        label="マイクラのユーザー名を入力してください",
+        placeholder="マイクラ上の名前",
+        min_length=1, max_length=20, required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            msg = await bot.register(interaction.user, str(self.username.value))
+        except Exception:
+            log.exception("register: failed")
+            msg = "登録中にエラーが起きました。少し待ってからもう一度試してください。"
+        await interaction.followup.send(msg, ephemeral=True)
+
+
+class RegisterView(discord.ui.View):
+    """Persistent view (timeout=None + fixed custom_ids): works after a bot restart."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="参加登録", emoji="🟢", style=discord.ButtonStyle.success,
+                       custom_id="mcreg:join")
+    async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(RegisterModal())
+
+    @discord.ui.button(label="登録一覧", emoji="📋", style=discord.ButtonStyle.secondary,
+                       custom_id="mcreg:list")
+    async def list_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not interaction.permissions.administrator:
+            await interaction.response.send_message(
+                "登録一覧は Discord サーバーの管理者だけが見られます。", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            entries = await asyncio.to_thread(wl_read)
+        except Exception:
+            await interaction.followup.send("ホワイトリストを読み込めませんでした。", ephemeral=True)
+            return
+        lines = []
+        linked_uuids, linked_names = set(), set()
+        for uid, r in bot.store.registrations.items():
+            linked_uuids.add(str(r.get("uuid", "")).lower())
+            linked_names.add(r["name"].lower())
+            note = "" if wl_find(entries, r["name"], r.get("uuid")) else "（ホワイトリストから外れています）"
+            lines.append(f"<@{uid}> → `{r['name']}`{note}")
+        for e in entries:
+            if (str(e.get("uuid", "")).lower() in linked_uuids
+                    or str(e.get("name", "")).lower() in linked_names):
+                continue
+            lines.append(f"Discord 未連携 → `{e.get('name', '?')}`")
+        if not lines:
+            await interaction.followup.send("まだ誰も登録していません。", ephemeral=True)
+            return
+        text, shown = "", 0
+        for line in lines:
+            if len(text) + len(line) + 1 > 3800:
+                break
+            text += line + "\n"
+            shown += 1
+        if shown < len(lines):
+            text += f"…ほか {len(lines) - shown} 件"
+        embed = discord.Embed(
+            title=f"📋 登録一覧（{len(lines)} 件）", description=text, color=discord.Color.blurple()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class StickyPanel:
+    """A panel message that is edited in place and kept as the last message of its channel
+    (same behaviour as the admin panel: saved message id, debounced re-send)."""
+
+    def __init__(self, channel_id: int, file: Path, build) -> None:
+        self.channel_id, self.file, self.build = channel_id, file, build
+        self.lock = asyncio.Lock()
+        self.repost_task: asyncio.Task | None = None
+        self.repost_first: float | None = None
+        self.repost_at = 0.0
+
+    def load(self) -> tuple[int, int] | None:
+        try:
+            d = json.loads(self.file.read_text())
+            return int(d["channel_id"]), int(d["message_id"])
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, KeyError, TypeError):
+            log.warning("%s を読み込めませんでした", self.file.name)
+            return None
+
+    def save(self, channel_id: int, message_id: int) -> None:
+        tmp = self.file.with_name(self.file.name + ".tmp")
+        tmp.write_text(json.dumps({"channel_id": channel_id, "message_id": message_id}))
+        tmp.replace(self.file)
+
+    async def channel(self):
+        return bot.get_channel(self.channel_id) or await bot.fetch_channel(self.channel_id)
+
+    async def refresh(self) -> None:
+        async with self.lock:
+            saved = self.load()
+            if saved is None:
+                return
+            embed, view = await self.build()
+            try:
+                ch = await self.channel()
+                await ch.get_partial_message(saved[1]).edit(embed=embed, view=view)
+            except discord.NotFound:
+                log.warning("register panel: message %s was deleted; re-sending", saved[1])
+                self.file.unlink(missing_ok=True)
+                self.request_repost(0)
+            except Exception:
+                log.exception("register panel: could not edit message %s", saved[1])
+
+    async def place(self, force: bool = False) -> None:
+        channel = await self.channel()
+        async with self.lock:
+            old = self.load()
+            if (not force and old is not None and old[0] == channel.id
+                    and channel.last_message_id == old[1]):
+                return
+            embed, view = await self.build()
+            message = await channel.send(embed=embed, view=view)  # send first, then delete the old one
+            self.save(channel.id, message.id)
+        if old is not None and old[1] != message.id:
+            try:
+                oc = bot.get_channel(old[0]) or await bot.fetch_channel(old[0])
+                await oc.get_partial_message(old[1]).delete()
+            except discord.NotFound:
+                pass
+            except Exception:
+                log.exception("register panel: could not delete old panel %s", old[1])
+
+    def request_repost(self, delay: float = PANEL_STICKY_DELAY) -> None:
+        now = time.monotonic()
+        if self.repost_first is None:
+            self.repost_first = now
+        self.repost_at = min(now + delay, self.repost_first + PANEL_STICKY_MAX)
+        if self.repost_task is None or self.repost_task.done():
+            self.repost_task = asyncio.create_task(self._worker())
+
+    async def _worker(self) -> None:
+        while self.repost_first is not None:
+            wait = self.repost_at - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+                continue
+            self.repost_first = None
+            try:
+                await self.place()
+            except Exception:
+                log.exception("register panel: could not re-send the panel")
+
+
 # ---------------------------------------------------------------- bot
 
 class McBot(discord.Client):
     def __init__(self) -> None:
-        super().__init__(intents=discord.Intents.default())
+        intents = discord.Intents.default()
+        # Privileged intent (must be ON in the Developer Portal): needed to notice members leaving.
+        # MEMBERS_INTENT=0 starts the bot without it (leaving members are then not removed).
+        intents.members = os.getenv("MEMBERS_INTENT", "1") != "0"
+        super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.warned = False
         self.panel_fast_since = 0.0
@@ -415,16 +874,32 @@ class McBot(discord.Client):
         self.repost_task: asyncio.Task | None = None
         self.repost_first: float | None = None  # when the first not-yet-handled message came in
         self.repost_at = 0.0
+        self.vd_applied: int | None = None  # view-distance the running server was started with
+        self.vd_error_logged = False
+        self.store = RegStore()
+        self.register_panel = StickyPanel(REGISTER_CHANNEL_ID, REGISTER_PANEL_FILE, build_register_panel)
 
     async def setup_hook(self) -> None:
         self.panel_wake = asyncio.Event()
         self.panel_lock = asyncio.Lock()
+        self.vd_lock = asyncio.Lock()
         self.add_view(PanelView())  # keep panel buttons working after a restart
+        self.reg_lock = asyncio.Lock()
+        self.add_view(RegisterView())
         self.tree.copy_global_to(guild=GUILD)
         await self.tree.sync(guild=GUILD)
         if ALERT_CHANNEL_ID:
             self.temp_watch.start()
         self.panel_task = asyncio.create_task(self.panel_loop())
+        self.reg_tasks: list[asyncio.Task] = []
+        if REGISTER_CHANNEL_ID and REGISTER_CHANNEL_ID == PANEL_CHANNEL_ID:
+            log.error("REGISTER_CHANNEL_ID と PANEL_CHANNEL_ID が同じです。別のチャンネルにしてください（登録機能は無効）")
+        elif REGISTER_CHANNEL_ID:
+            self.reg_tasks = [
+                asyncio.create_task(self.register_panel_loop()),
+                asyncio.create_task(self.pending_loop()),
+                asyncio.create_task(self.log_loop()),
+            ]
 
     # ------------------------------------------------------------ panel
 
@@ -549,7 +1024,218 @@ class McBot(discord.Client):
             except Exception:
                 log.exception("panel: could not re-send the panel")
 
+    # ------------------------------------------------------------ self-service registration
+
+    async def notify_user(self, user_id: int, text: str) -> None:
+        """DM the user; if DMs are closed, mention them in the register channel and delete it later."""
+        try:
+            user = self.get_user(user_id) or await self.fetch_user(user_id)
+            await user.send(text)
+            return
+        except (discord.Forbidden, discord.NotFound):
+            pass
+        except Exception:
+            log.exception("register: DM to %s failed", user_id)
+        try:
+            channel = await self.register_panel.channel()
+            await channel.send(
+                f"<@{user_id}> {text}",
+                allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=user_id)]),
+                delete_after=NOTICE_DELETE_AFTER,
+            )
+        except Exception:
+            log.exception("register: could not notify %s in the register channel", user_id)
+
+    async def _finalize(self, uid: str, name: str, uuid: str) -> None:
+        """Record uid -> (name, uuid). An older account of the same Discord user is removed first.
+        Caller holds reg_lock."""
+        old = self.store.registrations.get(uid)
+        if old and str(old.get("uuid", "")).lower() != uuid.lower():
+            await wl_remove(old["name"], old.get("uuid"))
+        self.store.registrations[uid] = {"name": name, "uuid": uuid, "at": int(time.time())}
+        self.store.pending.pop(uid, None)
+        self.store.save()
+
+    async def register(self, user: discord.abc.User, raw: str) -> str:
+        names = normalize_name(raw)
+        if names is None:
+            return ("ユーザー名に使えない文字があります。英数字・「_」・スペースだけ、16文字までで入力してください。"
+                    "（マイクラ上の名前をそのまま入力してください）")
+        orig, ingame = names
+        uid = str(user.id)
+        async with self.reg_lock:
+            cur = self.store.registrations.get(uid)
+            same_as_cur = cur is not None and cur["name"].lower() == ingame.lower()
+            other = self.store.owner_of_name(ingame)
+            if other is not None and other != uid:
+                return "その名前はほかの Discord ユーザーがすでに登録しています。"
+            other_p = self.store.pending_owner_of_name(ingame)
+            if other_p is not None and other_p != uid:
+                return "その名前は、ほかの人が登録の手続き中です。少し待ってからやり直してください。"
+            entries = wl_read()
+            existing = wl_find(entries, ingame)
+            if existing is not None and not same_as_cur:
+                return ("その名前はすでにホワイトリストに入っています（管理者が登録した名前など）。"
+                        "自分の名前なのに登録できない場合は、管理者に連絡してください。")
+            if same_as_cur and existing is not None:
+                return f"すでにこの名前（`{ingame}`）で登録済みです。上のアドレスとポートで接続してください。"
+
+            try:
+                await rcon_command(f"fwhitelist add {orig}")
+            except Exception:
+                return "サーバーに接続できませんでした（停止中かもしれません）。サーバーが起動してから、もう一度試してください。"
+            # fwhitelist reports problems only in the server console, so check the file instead.
+            found = None
+            for _ in range(14):
+                await asyncio.sleep(0.5)
+                found = wl_find(wl_read(), ingame)
+                if found:
+                    break
+            if found:
+                await self._finalize(uid, found["name"], found["uuid"])
+                return "登録しました！上のアドレスとポートで接続してください。\n" + addr_text()
+
+            self.store.pending[uid] = {
+                "name": ingame, "orig": orig, "expires": time.time() + PENDING_TTL,
+            }
+            self.store.save()
+            return (
+                "10分以内に、マイクラから上のアドレスとポートでサーバーに一度接続してください。\n"
+                "ホワイトリストで弾かれますが、それで本人確認が完了します。\n"
+                f"（接続先: {addr_text()} ／ 登録する名前: `{ingame}`）"
+            )
+
+    async def on_reject(self, name: str, uuid: str) -> None:
+        """A connection was rejected by the whitelist: complete a matching pending request."""
+        if not uuid.lower().startswith(FLOODGATE_UUID_PREFIX):
+            return  # only Bedrock (floodgate) accounts can be registered
+        async with self.reg_lock:
+            now = time.time()
+            uid = next(
+                (u for u, p in self.store.pending.items()
+                 if p["name"].lower() == name.lower() and p["expires"] > now),
+                None,
+            )
+            if uid is None:
+                return
+            if self.store.owner_of_name(name) not in (None, uid):
+                self.store.pending.pop(uid, None)
+                self.store.save()
+                return
+            await wl_add(uuid, name)
+            await self._finalize(uid, name, uuid)
+        log.info("register: %s registered %s", uid, name)
+        await self.notify_user(int(uid), "登録しました！もう一度接続してください。")
+
+    async def unregister(self, discord_id: int, reason: str) -> str | None:
+        """Drop a Discord user's account from the whitelist and the registry. Returns the name."""
+        uid = str(discord_id)
+        async with self.reg_lock:
+            r = self.store.registrations.pop(uid, None)
+            had_pending = self.store.pending.pop(uid, None) is not None
+            if r is None and not had_pending:
+                return None
+            self.store.save()
+            if r is not None:
+                await wl_remove(r["name"], r.get("uuid"))
+        if r is not None:
+            log.info("register: removed %s of %s (%s)", r["name"], uid, reason)
+        return r["name"] if r else None
+
+    async def on_member_remove(self, member: discord.Member) -> None:
+        if member.guild.id == GUILD_ID:
+            await self.unregister(member.id, "left the server")
+
+    async def reconcile_members(self) -> None:
+        """Members who left while the bot was offline lose their whitelist entry too."""
+        guild = self.get_guild(GUILD_ID)
+        if guild is None:
+            return
+        for uid in list(self.store.registrations):
+            if guild.get_member(int(uid)) is not None:
+                continue
+            try:
+                await guild.fetch_member(int(uid))
+            except discord.NotFound:
+                await self.unregister(int(uid), "left the server (found at startup)")
+            except Exception:
+                log.exception("register: could not check member %s", uid)
+
+    async def pending_loop(self) -> None:
+        await self.wait_until_ready()
+        try:
+            await self.reconcile_members()
+        except Exception:
+            log.exception("register: reconcile failed")
+        while not self.is_closed():
+            try:
+                async with self.reg_lock:
+                    now = time.time()
+                    expired = [u for u, p in self.store.pending.items() if p["expires"] <= now]
+                    for u in expired:
+                        del self.store.pending[u]
+                    if expired:
+                        self.store.save()
+                for u in expired:
+                    await self.notify_user(int(u), "期限切れです。もう一度「参加登録」を押してください。")
+            except Exception:
+                log.exception("register: expiry check failed")
+            await asyncio.sleep(20)
+
+    async def log_loop(self) -> None:
+        """Follow logs/latest.log and pick up the plugin's REJECT lines."""
+        await self.wait_until_ready()
+        ino: int | None = None
+        pos = 0
+        buf = b""
+        try:
+            st = MC_LOG_FILE.stat()
+            ino, pos = st.st_ino, st.st_size  # old lines are not replayed
+        except OSError:
+            pass
+        failed = False
+        while not self.is_closed():
+            try:
+                st = MC_LOG_FILE.stat()
+                if st.st_ino != ino or st.st_size < pos:  # rotated (server restart) or truncated
+                    ino, pos, buf = st.st_ino, 0, b""
+                if st.st_size > pos:
+                    with open(MC_LOG_FILE, "rb") as f:
+                        f.seek(pos)
+                        data = f.read()
+                    pos += len(data)
+                    *lines, buf = (buf + data).split(b"\n")
+                    for raw_line in lines:
+                        m = REJECT_RE.search(raw_line.decode("utf-8", errors="replace"))
+                        if m:
+                            await self.on_reject(m.group(1), m.group(2))
+                failed = False
+            except FileNotFoundError:
+                pass
+            except Exception:
+                if not failed:  # log once per failure streak
+                    log.exception("register: log watcher error")
+                failed = True
+            await asyncio.sleep(1)
+
+    async def register_panel_loop(self) -> None:
+        await self.wait_until_ready()
+        try:
+            await self.register_panel.place()
+        except Exception:
+            log.exception("register panel: could not place the panel in channel %s", REGISTER_CHANNEL_ID)
+        while not self.is_closed():
+            await asyncio.sleep(PANEL_INTERVAL)
+            try:
+                await self.register_panel.refresh()
+            except Exception:
+                log.exception("register panel: refresh failed")
+
     async def on_message(self, message: discord.Message) -> None:
+        if (REGISTER_CHANNEL_ID and message.channel.id == REGISTER_CHANNEL_ID
+                and self.reg_tasks
+                and not (self.user is not None and message.author.id == self.user.id)):
+            self.register_panel.request_repost()
         if not PANEL_CHANNEL_ID or message.channel.id != PANEL_CHANNEL_ID:
             return
         if self.user is not None and message.author.id == self.user.id:
@@ -730,6 +1416,26 @@ async def panel(interaction: discord.Interaction) -> None:
     if note:
         msg += "\n" + note
     await interaction.followup.send(msg, ephemeral=True)
+
+
+@bot.tree.command(name="登録解除", description="ユーザーのマイクラアカウントをホワイトリストから外します（管理者のみ）")
+@app_commands.describe(user="登録を解除する Discord ユーザー")
+@app_commands.rename(user="ユーザー")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def unregister_cmd(interaction: discord.Interaction, user: discord.User) -> None:
+    if not interaction.permissions.administrator:
+        await interaction.response.send_message("このコマンドは Discord サーバーの管理者だけが使えます。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    name = await bot.unregister(user.id, f"/登録解除 by {interaction.user.id}")
+    if name is None:
+        await interaction.followup.send(f"{user.mention} の登録は見つかりませんでした。", ephemeral=True)
+    else:
+        await interaction.followup.send(
+            f"{user.mention} の `{name}` をホワイトリストから外しました。（遊んでいる最中の場合、退出するまでは入ったままです）",
+            ephemeral=True,
+        )
 
 
 if __name__ == "__main__":

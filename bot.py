@@ -8,8 +8,10 @@ Slash commands:
   /cmd     Run a server console command via RCON (admins only)
   /panel   Post a server control panel with buttons (admins only)
 
-If PANEL_CHANNEL_ID is set, the panel is kept as the last message of that channel:
-when someone posts there, the old panel is deleted and a new one is sent at the bottom.
+The panel also has a select menu to change view-distance in server.properties
+(Discord server administrators only). If PANEL_CHANNEL_ID is set, the panel is
+kept as the last message of that channel: when someone posts there, the old
+panel is deleted and a new one is sent at the bottom.
 """
 
 from __future__ import annotations
@@ -19,7 +21,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
+import stat
 import struct
 import subprocess
 import time
@@ -50,6 +54,17 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 # Temperature alert (Celsius). Set ALERT_CHANNEL_ID to enable.
 ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0") or 0)
 TEMP_WARN = float(os.getenv("TEMP_WARN", "75"))
+
+# server.properties of the Minecraft server (only the view-distance line is touched).
+SERVER_PROPERTIES = Path(
+    os.path.expanduser(os.getenv("SERVER_PROPERTIES", "") or "~/minecraft/server.properties")
+)
+VIEW_DISTANCE_CHOICES = [
+    (6, "6（軽い）"),
+    (8, "8（おすすめ）"),
+    (10, "10（4人くらいまで）"),
+    (12, "12（重い・少人数向け）"),
+]
 
 # Channel where the panel is kept at the bottom (0 = off: the panel stays where /panel put it).
 PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0") or 0)
@@ -183,6 +198,64 @@ def temp_label(t: float | None) -> str:
     return f"{t:.1f}℃ ✅"
 
 
+# ---------------------------------------------------------------- server.properties
+
+# Matches the whole view-distance line; group 2 is the number. Works on bytes so that
+# every other byte of the file (comments, order, line endings, encoding) stays as is.
+VIEW_DISTANCE_RE = re.compile(rb"^([ \t]*view-distance[ \t]*[=:][ \t]*)(\d+)([ \t]*\r?)$", re.M)
+
+
+class PropertiesError(Exception):
+    pass
+
+
+def _find_view_distance(data: bytes) -> re.Match[bytes]:
+    matches = list(VIEW_DISTANCE_RE.finditer(data))
+    if not matches:
+        raise PropertiesError("server.properties に view-distance の行が見つかりません")
+    if len(matches) > 1:
+        raise PropertiesError("server.properties に view-distance の行が複数あります")
+    return matches[0]
+
+
+def read_view_distance() -> int:
+    return int(_find_view_distance(SERVER_PROPERTIES.read_bytes()).group(2))
+
+
+def write_view_distance(new: int) -> tuple[int, Path | None]:
+    """Rewrite only the number on the view-distance line. Returns (old value, backup path)."""
+    path = SERVER_PROPERTIES
+    data = path.read_bytes()
+    m = _find_view_distance(data)
+    old = int(m.group(2))
+    if old == new:
+        return old, None
+
+    # Same naming as the existing backups: server.properties.bak-YYYYMMDDHHMMSS
+    while True:
+        backup = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%d%H%M%S')}")
+        if not backup.exists():
+            break
+        time.sleep(1)  # never overwrite an older backup made in the same second
+    shutil.copy2(path, backup)  # keeps the 600 permission (the file holds rcon.password)
+
+    new_data = data[:m.start(2)] + str(new).encode() + data[m.end(2):]
+    mode = stat.S_IMODE(path.stat().st_mode)
+    tmp = path.with_name(path.name + ".mcbot-tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(new_data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)  # atomic: the file is never half written
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return old, backup
+
+
 # ---------------------------------------------------------------- panel state
 
 ONLINE, OFFLINE, STARTING, STOPPING = "online", "offline", "starting", "stopping"
@@ -249,6 +322,25 @@ async def build_panel() -> tuple[discord.Embed, PanelView, str]:
     else:
         count = "-"
     embed.add_field(name="オンライン人数", value=count, inline=True)
+
+    try:
+        vd = await asyncio.to_thread(read_view_distance)
+        bot.vd_error_logged = False
+    except Exception as e:
+        vd = None
+        if not bot.vd_error_logged:  # log once, and never the file's contents
+            bot.vd_error_logged = True
+            log.warning("panel: could not read view-distance: %s", type(e).__name__)
+    if vd is None:
+        vd_text = "取得できませんでした"
+    else:
+        # While the server is not running, whatever is in the file is what it will use.
+        if info.state != ONLINE or bot.vd_applied is None:
+            bot.vd_applied = vd
+        vd_text = str(vd)
+        if vd != bot.vd_applied:
+            vd_text += "（再起動で反映）"
+    embed.add_field(name="描画距離", value=vd_text, inline=True)
 
     if info.state != ONLINE:
         players = "-"
@@ -402,6 +494,44 @@ class PanelView(discord.ui.View):
         # --no-block: systemd carries out the restart even though it kills this process.
         await systemctl("restart", "--no-block", BOT_SERVICE)
 
+    @discord.ui.select(
+        custom_id="mcpanel:viewdistance",
+        placeholder="🔭 描画距離を変更（管理者のみ・再起動で反映）",
+        options=[discord.SelectOption(label=label, value=str(v)) for v, label in VIEW_DISTANCE_CHOICES],
+        row=2,
+    )
+    async def view_distance_select(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:
+        if not interaction.permissions.administrator:
+            await interaction.response.send_message(
+                "描画距離の変更は Discord サーバーの管理者だけができます。", ephemeral=True
+            )
+            bot.panel_wake.set()  # re-render the panel so the menu goes back to its placeholder
+            return
+        new = int(select.values[0])
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            async with bot.vd_lock:
+                old, _backup = await asyncio.to_thread(write_view_distance, new)
+        except PropertiesError as e:
+            await interaction.followup.send(f"変更できませんでした: {e}", ephemeral=True)
+            return
+        except Exception as e:
+            log.exception("view-distance: could not update %s", SERVER_PROPERTIES)
+            await interaction.followup.send(
+                f"変更できませんでした（{type(e).__name__}）。ボットのログを確認してください。", ephemeral=True
+            )
+            return
+        finally:
+            bot.panel_wake.set()
+        if old == new:
+            await interaction.followup.send(f"描画距離はすでに {new} です。", ephemeral=True)
+            return
+        log.info("view-distance: %s -> %s by %s", old, new, interaction.user.id)
+        await interaction.followup.send(
+            f"描画距離を {old} → {new} に変更しました。再起動で反映されます", ephemeral=True
+        )
+
+
 # ---------------------------------------------------------------- bot
 
 class McBot(discord.Client):
@@ -415,10 +545,13 @@ class McBot(discord.Client):
         self.repost_task: asyncio.Task | None = None
         self.repost_first: float | None = None  # when the first not-yet-handled message came in
         self.repost_at = 0.0
+        self.vd_applied: int | None = None  # view-distance the running server was started with
+        self.vd_error_logged = False
 
     async def setup_hook(self) -> None:
         self.panel_wake = asyncio.Event()
         self.panel_lock = asyncio.Lock()
+        self.vd_lock = asyncio.Lock()
         self.add_view(PanelView())  # keep panel buttons working after a restart
         self.tree.copy_global_to(guild=GUILD)
         await self.tree.sync(guild=GUILD)

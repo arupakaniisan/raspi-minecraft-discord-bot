@@ -12,12 +12,15 @@ Slash commands:
   /登録解除  Remove a member's Minecraft account from the whitelist (Discord administrators only)
 
 The panel also has a select menu to change view-distance in server.properties
-(Discord server administrators only). If PANEL_CHANNEL_ID is set, the panel is
+(anyone can use it). If PANEL_CHANNEL_ID is set, the panel is
 kept as the last message of that channel: when someone posts there, the old
 panel is deleted and a new one is sent at the bottom.
 
 Self-service whitelist: a second panel in REGISTER_CHANNEL_ID lets any member of the Discord
 server register their own Bedrock account (see the "registration" section below).
+
+Idle auto-stop: when nobody has been online for AUTO_STOP_MINUTES in a row, the server is
+stopped (same as the panel's stop button) and a silent notice is posted to the panel channel.
 """
 
 from __future__ import annotations
@@ -65,6 +68,11 @@ TEMP_WARN = float(os.getenv("TEMP_WARN", "75"))
 TEMP_SHUTDOWN = float(os.getenv("TEMP_SHUTDOWN", "85") or 0)
 TEMP_SHUTDOWN_COUNT = 3
 TEMP_CHECK_SECONDS = 30
+
+# Stop the Minecraft server after nobody has been online for this many minutes in a row
+# (counted from when the server came up, so a fresh start always gets the full time). 0 = off.
+AUTO_STOP_MINUTES = int(os.getenv("AUTO_STOP_MINUTES", "60") or 0)
+IDLE_CHECK_SECONDS = 60
 
 # server.properties of the Minecraft server (only the view-distance line is touched).
 SERVER_PROPERTIES = Path(
@@ -373,17 +381,17 @@ async def build_panel() -> tuple[discord.Embed, PanelView, str]:
         players = "\n".join(show_name(n) for n in info.players) or "なし"
     embed.add_field(name="接続中のプレイヤー", value=players[:1024], inline=False)
 
+    left = bot.idle_minutes_left()
+    if info.state == ONLINE and info.count == 0 and left is not None:
+        step = 10 if AUTO_STOP_MINUTES > 10 else 1
+        shown = max(step, -(-left // step) * step)  # round up to the step
+        embed.add_field(name="自動停止", value=f"⏳ 自動停止まで あと{shown}分", inline=False)
+
     embed.add_field(
         name="ラズパイ",
         value=f"🌡️ {temp_label(cpu_temp())} ・ CPU {cpu:.0f}% ・ メモリ {mem.percent:.0f}%",
         inline=False,
     )
-    if SERVER_ADDRESS:
-        addr = f"`{SERVER_ADDRESS}` / ポート `{SERVER_PORT}`"
-    else:
-        addr = "未設定"
-    embed.add_field(name="接続先", value=addr, inline=False)
-
     embed.set_footer(text="最終更新")
     embed.timestamp = discord.utils.utcnow()
     return embed, PanelView(info.state), info.state
@@ -437,15 +445,15 @@ class PanelView(discord.ui.View):
             await interaction.response.send_message(msg, ephemeral=True)
             bot.panel_fast()
             return
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         bot.panel_fast()
         code, out = await systemctl("start", SERVICE_NAME)
         bot.panel_fast()
         if code != 0:
-            await interaction.followup.send(f"起動に失敗しました。\n```\n{out[:1500]}\n```")
+            await interaction.followup.send(f"起動に失敗しました。\n```\n{out[:1500]}\n```", silent=True)
             return
         await interaction.followup.send(
-            f"🟢 {interaction.user.display_name} さんがサーバーを起動しました。入れるようになるまで1分ほど待ってください。"
+            f"🟢 {interaction.user.display_name} さんがサーバーを起動しました。入れるようになるまで1分ほど待ってください。", silent=True
         )
 
     @discord.ui.button(label="停止", emoji="⏹️", style=discord.ButtonStyle.danger,
@@ -455,14 +463,14 @@ class PanelView(discord.ui.View):
             await interaction.response.send_message("サーバーは起動していません。", ephemeral=True)
             bot.panel_fast()
             return
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         bot.panel_fast()
         code, out = await systemctl("stop", SERVICE_NAME)
         bot.panel_fast()
         if code != 0:
-            await interaction.followup.send(f"停止に失敗しました。\n```\n{out[:1500]}\n```")
+            await interaction.followup.send(f"停止に失敗しました。\n```\n{out[:1500]}\n```", silent=True)
             return
-        await interaction.followup.send(f"🔴 {interaction.user.display_name} さんがサーバーを停止しました。ワールドは保存済みです。")
+        await interaction.followup.send(f"🔴 {interaction.user.display_name} さんがサーバーを停止しました。ワールドは保存済みです。", silent=True)
 
     @discord.ui.button(label="再起動", emoji="🔄", style=discord.ButtonStyle.primary,
                        custom_id="mcpanel:restart", row=0)
@@ -473,15 +481,15 @@ class PanelView(discord.ui.View):
             )
             bot.panel_fast()
             return
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         bot.panel_fast()
         code, out = await systemctl("restart", SERVICE_NAME)
         bot.panel_fast()
         if code != 0:
-            await interaction.followup.send(f"再起動に失敗しました。\n```\n{out[:1500]}\n```")
+            await interaction.followup.send(f"再起動に失敗しました。\n```\n{out[:1500]}\n```", silent=True)
             return
         await interaction.followup.send(
-            f"🔄 {interaction.user.display_name} さんがサーバーを再起動しました。入れるようになるまで1分ほど待ってください。"
+            f"🔄 {interaction.user.display_name} さんがサーバーを再起動しました。入れるようになるまで1分ほど待ってください。", silent=True
         )
 
     @discord.ui.button(label="更新", emoji="🔃", style=discord.ButtonStyle.secondary,
@@ -501,7 +509,7 @@ class PanelView(discord.ui.View):
                        custom_id="mcpanel:botrestart", row=1)
     async def bot_restart_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_message(
-            f"🤖 {interaction.user.display_name} さんがボットを再起動しました。10秒ほどで戻ってきます。"
+            f"🤖 {interaction.user.display_name} さんがボットを再起動しました。10秒ほどで戻ってきます。", silent=True
         )
         log.info("panel: bot restart requested by %s", interaction.user.id)
         # --no-block: systemd carries out the restart even though it kills this process.
@@ -509,19 +517,13 @@ class PanelView(discord.ui.View):
 
     @discord.ui.select(
         custom_id="mcpanel:viewdistance",
-        placeholder="🔭 描画距離を変更（管理者のみ・再起動で反映）",
+        placeholder="🔭 描画距離を変更（再起動で反映）",
         options=[discord.SelectOption(label=label, value=str(v)) for v, label in VIEW_DISTANCE_CHOICES],
         row=2,
     )
     async def view_distance_select(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message(
-                "描画距離の変更は Discord サーバーの管理者だけができます。", ephemeral=True
-            )
-            bot.panel_wake.set()  # re-render the panel so the menu goes back to its placeholder
-            return
         new = int(select.values[0])
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer()
         try:
             async with bot.vd_lock:
                 old, _backup = await asyncio.to_thread(write_view_distance, new)
@@ -537,11 +539,11 @@ class PanelView(discord.ui.View):
         finally:
             bot.panel_wake.set()
         if old == new:
-            await interaction.followup.send(f"描画距離はすでに {new} です。")
+            await interaction.followup.send(f"描画距離はすでに {new} です。", silent=True)
             return
         log.info("view-distance: %s -> %s by %s", old, new, interaction.user.id)
         await interaction.followup.send(
-            f"{interaction.user.display_name} さんが描画距離を {old} → {new} に変更しました。再起動で反映されます"
+            f"{interaction.user.display_name} さんが描画距離を {old} → {new} に変更しました。再起動で反映されます", silent=True
         )
 
 
@@ -912,7 +914,7 @@ class StickyPanel:
                     and channel.last_message_id == old[1]):
                 return
             embed, view = await self.build()
-            message = await channel.send(embed=embed, view=view)  # send first, then delete the old one
+            message = await channel.send(embed=embed, view=view, silent=True)  # send first, then delete the old one
             self.save(channel.id, message.id)
         if old is not None and old[1] != message.id:
             try:
@@ -958,6 +960,8 @@ class McBot(discord.Client):
         super().__init__(intents=intents, max_messages=None)  # no message cache: only new messages matter
         self.tree = app_commands.CommandTree(self)
         self.warned = False
+        self.idle_since: float | None = None   # monotonic time the server was first seen empty
+        self.idle_unit_start: str | None = None  # minecraft unit start stamp (detects restarts)
         self.hot_count = 0  # consecutive checks at or above TEMP_SHUTDOWN
         self.panel_fast_since = 0.0
         self.panel_fast_until = 0.0
@@ -981,6 +985,8 @@ class McBot(discord.Client):
         await self.tree.sync(guild=GUILD)
         if ALERT_CHANNEL_ID or TEMP_SHUTDOWN:
             self.temp_watch.start()  # warnings need ALERT_CHANNEL_ID; the auto-stop works without it
+        if AUTO_STOP_MINUTES > 0:
+            self.idle_watch.start()
         self.panel_task = asyncio.create_task(self.panel_loop())
         self.reg_tasks: list[asyncio.Task] = []
         if REGISTER_CHANNEL_ID and REGISTER_CHANNEL_ID == PANEL_CHANNEL_ID:
@@ -1078,7 +1084,7 @@ class McBot(discord.Client):
                 return None, ""
             embed, view, _ = await build_panel()
             # Send first, then delete: there is never a moment without a panel.
-            message = await channel.send(embed=embed, view=view)
+            message = await channel.send(embed=embed, view=view, silent=True)
             save_panel(channel.id, message.id)
         note = ""
         if old is not None and old[1] != message.id:
@@ -1372,6 +1378,81 @@ class McBot(discord.Client):
     async def before_temp_watch(self) -> None:
         await self.wait_until_ready()
 
+    # ------------------------------------------------------------ idle auto-stop
+
+    def idle_minutes_left(self) -> int | None:
+        """Whole minutes (rounded up) until the idle auto-stop, or None if not counting."""
+        if AUTO_STOP_MINUTES <= 0 or self.idle_since is None:
+            return None
+        left = AUTO_STOP_MINUTES * 60 - (time.monotonic() - self.idle_since)
+        return max(0, int(-(-left // 60)))
+
+    async def idle_check_once(self) -> None:
+        info = await server_info()
+        if info.state != ONLINE:
+            self.idle_since = None  # stopped / still booting: the count starts once it is up
+            self.idle_unit_start = None
+            return
+        _, stamp = await systemctl("show", SERVICE_NAME, "-p", "ActiveEnterTimestampMonotonic", "--value")
+        if stamp != self.idle_unit_start:  # (re)started since the last check: start over
+            self.idle_unit_start = stamp
+            self.idle_since = None
+        if not info.players_ok or info.count is None:
+            return  # unknown player count: neither count up nor stop
+        if info.count > 0:
+            self.idle_since = None
+            return
+        now = time.monotonic()
+        if self.idle_since is None:
+            self.idle_since = now
+            log.info("idle: server is empty, auto-stop in %d min", AUTO_STOP_MINUTES)
+            self.panel_wake.set()
+            return
+        if now - self.idle_since < AUTO_STOP_MINUTES * 60:
+            return
+
+        # Check once more right before stopping, in case someone just joined.
+        info = await server_info()
+        if info.state != ONLINE or not info.players_ok or info.count != 0:
+            if info.count:
+                self.idle_since = None
+            return
+        log.info("idle: nobody online for %d min, stopping %s", AUTO_STOP_MINUTES, SERVICE_NAME)
+        self.idle_since = None
+        self.panel_fast()
+        code, out = await systemctl("stop", SERVICE_NAME)
+        self.panel_fast()
+        if code != 0:
+            log.error("idle: stop failed: %s", out)
+            text = f"{AUTO_STOP_MINUTES}分間誰もいなかったのでサーバーを止めようとしましたが、失敗しました。\n```\n{out[:1500]}\n```"
+        else:
+            text = (
+                f"💤 {AUTO_STOP_MINUTES}分間誰もいなかったので、サーバーを自動停止しました。"
+                "遊ぶときは ▶ 起動 を押してください"
+            )
+        channel_id = PANEL_CHANNEL_ID or (load_panel() or (0, 0))[0]
+        if not channel_id:
+            return
+        try:
+            channel = self.get_channel(channel_id) or await self.fetch_channel(channel_id)
+            await channel.send(text, silent=True)
+        except Exception:
+            log.exception("idle: could not post the auto-stop notice to %s", channel_id)
+            return
+        if PANEL_CHANNEL_ID:
+            self.request_repost(2)  # keep the panel below the notice
+
+    @tasks.loop(seconds=IDLE_CHECK_SECONDS)
+    async def idle_watch(self) -> None:
+        try:
+            await self.idle_check_once()
+        except Exception:
+            log.exception("idle: check failed")
+
+    @idle_watch.before_loop
+    async def before_idle_watch(self) -> None:
+        await self.wait_until_ready()
+
 
 bot = McBot()
 
@@ -1379,53 +1460,53 @@ bot = McBot()
 @bot.tree.command(name="start", description="マイクラサーバーを起動します")
 async def start(interaction: discord.Interaction) -> None:
     if await is_running():
-        await interaction.response.send_message("サーバーはすでに起動しています。")
+        await interaction.response.send_message("サーバーはすでに起動しています。", silent=True)
         return
     await interaction.response.defer(thinking=True)
     code, out = await systemctl("start", SERVICE_NAME)
     if code != 0:
-        await interaction.followup.send(f"起動に失敗しました。\n```\n{out[:1500]}\n```")
+        await interaction.followup.send(f"起動に失敗しました。\n```\n{out[:1500]}\n```", silent=True)
         return
     msg = "🟢 サーバーを起動しました。入れるようになるまで1分ほど待ってください。"
     if SERVER_ADDRESS:
         msg += f"\nアドレス: `{SERVER_ADDRESS}` ポート: `{SERVER_PORT}`"
-    await interaction.followup.send(msg)
+    await interaction.followup.send(msg, silent=True)
 
 
 @bot.tree.command(name="stop", description="マイクラサーバーを停止します（保存してから止めます）")
 async def stop(interaction: discord.Interaction) -> None:
     if not await is_running():
-        await interaction.response.send_message("サーバーはすでに停止しています。")
+        await interaction.response.send_message("サーバーはすでに停止しています。", silent=True)
         return
     await interaction.response.defer(thinking=True)
     code, out = await systemctl("stop", SERVICE_NAME)
     if code != 0:
-        await interaction.followup.send(f"停止に失敗しました。\n```\n{out[:1500]}\n```")
+        await interaction.followup.send(f"停止に失敗しました。\n```\n{out[:1500]}\n```", silent=True)
         return
-    await interaction.followup.send(f"🔴 {interaction.user.display_name} さんがサーバーを停止しました。ワールドは保存済みです。")
+    await interaction.followup.send(f"🔴 {interaction.user.display_name} さんがサーバーを停止しました。ワールドは保存済みです。", silent=True)
 
 
 @bot.tree.command(name="restart", description="マイクラサーバーを再起動します（保存してから再起動します）")
 async def restart(interaction: discord.Interaction) -> None:
     if await unit_state() not in ("active", "activating"):
-        await interaction.response.send_message("サーバーは起動していません。`/start` を使ってください。")
+        await interaction.response.send_message("サーバーは起動していません。`/start` を使ってください。", silent=True)
         return
     await interaction.response.defer(thinking=True)
     bot.panel_fast()
     code, out = await systemctl("restart", SERVICE_NAME)
     bot.panel_fast()
     if code != 0:
-        await interaction.followup.send(f"再起動に失敗しました。\n```\n{out[:1500]}\n```")
+        await interaction.followup.send(f"再起動に失敗しました。\n```\n{out[:1500]}\n```", silent=True)
         return
     await interaction.followup.send(
-        f"🔄 {interaction.user.display_name} さんがサーバーを再起動しました。入れるようになるまで1分ほど待ってください。"
+        f"🔄 {interaction.user.display_name} さんがサーバーを再起動しました。入れるようになるまで1分ほど待ってください。", silent=True
     )
 
 
 @bot.tree.command(name="botrestart", description="このボットを再起動します（10秒ほどで戻ります）")
 async def botrestart(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(
-        f"🤖 {interaction.user.display_name} さんがボットを再起動しました。10秒ほどで戻ってきます。"
+        f"🤖 {interaction.user.display_name} さんがボットを再起動しました。10秒ほどで戻ってきます。", silent=True
     )
     log.info("command: bot restart requested by %s", interaction.user.id)
     # --no-block: systemd carries out the restart even though it kills this process.
@@ -1449,13 +1530,13 @@ async def status(interaction: discord.Interaction) -> None:
             embed.add_field(name="プレイヤー", value="取得できませんでした（起動直後かもしれません）", inline=False)
     if SERVER_ADDRESS:
         embed.add_field(name="接続先", value=f"`{SERVER_ADDRESS}` / ポート `{SERVER_PORT}`", inline=False)
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, silent=True)
 
 
 @bot.tree.command(name="pc", description="ラズパイの温度・CPU・メモリを表示します")
 async def pc(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True)
-    await interaction.followup.send(embed=await build_pc_embed())
+    await interaction.followup.send(embed=await build_pc_embed(), silent=True)
 
 
 async def build_pc_embed() -> discord.Embed:
